@@ -1,0 +1,44 @@
+# 환경변수 (절대 커밋 금지)
+.env
+.env1
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 빌드/배포
+dist/
+build/
+*.egg-info/
+
+# Antigravity CLI
+.antigravitycli/
+
+# Claude Code
+.claude/
+
+# OMC 런타임 상태 (세션/로그, 버전관리 대상 아님)
+.omc/
+!.omc/skills/
+
+# 사내 문서 (내부 공유 금지)
+업무_시나리오.md
+조직매핑.md
+
+# PDF 배포 파일
+*.pdf
+pdf_style.css
+make_pdf.py
+make_pdf.js
+test_pdf.md

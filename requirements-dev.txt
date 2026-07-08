@@ -1,0 +1,7 @@
+# 개발자용 — HTTP 모드 실행 및 로컬 개발 환경
+# 사용법: pip install -r requirements-dev.txt
+-r requirements.txt
+
+# HTTP 모드 서버 실행 (server.py --http)
+uvicorn>=0.30.0
+starlette>=0.40.0

@@ -1,0 +1,1977 @@
+# ms365/graph_read.py — MS365 Graph API 읽기 도구 모듈
+# ──────────────────────────────────────────────────────────────
+# Claude.ai MS365 MCP의 7개 읽기 도구를 Graph API로 구현
+# (Delegated 권한 / DeviceCodeCredential — 사용자 본인 로그인)
+#
+# [Delegated 권한 필요 목록]
+#   Mail.Read              — 이메일 읽기
+#   Calendars.Read         — 캘린더/일정 읽기 + getSchedule
+#   Sites.Read.All         — SharePoint 사이트 검색
+#   Files.Read.All         — 파일 내용 읽기
+#
+# [chat_message_search]
+#   Delegated 인증 전환으로 향후 구현 가능.
+#   현재는 Graph Search API 제약으로 미구현 상태 유지.
+# ──────────────────────────────────────────────────────────────
+
+import os
+import logging
+from typing import Annotated, List
+from urllib.parse import urlparse
+
+from pydantic import Field
+
+log = logging.getLogger("royal-mcp.ms365-read")
+
+
+def _extract_id_from_uri(uri: str) -> str:
+    """Graph API URL 또는 raw ID 문자열에서 리소스 ID를 추출합니다."""
+    parsed = urlparse(uri)
+    if parsed.scheme in ("https", "http") and "graph.microsoft.com" in (parsed.netloc or ""):
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts:
+            return parts[-1]
+    return uri
+
+
+def _parse_drive_and_item(uri: str):
+    """Graph API URL에서 (drive_id, item_id) 쌍을 반환합니다.
+    형식: .../drives/{driveId}/items/{itemId}
+    파싱 실패 시 (None, uri) 반환.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme in ("https", "http"):
+        parts = [p for p in parsed.path.split("/") if p]
+        try:
+            drive_idx = parts.index("drives")
+            item_idx = parts.index("items", drive_idx)
+            return parts[drive_idx + 1], parts[item_idx + 1]
+        except (ValueError, IndexError):
+            pass
+    return None, uri
+
+
+def _to_kst_date(utc_str: str) -> str:
+    """UTC datetime 문자열을 KST 날짜(YYYY-MM-DD)로 변환합니다. 파싱 실패 시 빈 문자열 반환."""
+    if not utc_str:
+        return ""
+    try:
+        from datetime import datetime, timezone, timedelta
+        s = utc_str.replace("Z", "+00:00")
+        # 하위 호환: 소수점 이하 7자리 이상이면 6자리로 잘라냄 (Python 3.10 이하 대비)
+        if "." in s:
+            head, tail = s.split(".", 1)
+            digits, i = "", 0
+            while i < len(tail) and tail[i].isdigit():
+                digits += tail[i]; i += 1
+            s = f"{head}.{digits[:6]}{tail[i:]}"
+        dt = datetime.fromisoformat(s)
+        return dt.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _encode_sharing_url(url: str) -> str:
+    """SharePoint/OneDrive URL을 Graph Shares API 토큰으로 인코딩합니다."""
+    import base64
+    b64 = base64.urlsafe_b64encode(url.encode("utf-8")).rstrip(b"=").decode("utf-8")
+    return f"u!{b64}"
+
+
+def _file_type_from_meta(mime_type: str, filename: str) -> str:
+    """MIME 타입과 파일명 확장자로 파일 유형을 반환합니다."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" or ext == "xlsx":
+        return "xlsx"
+    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or ext == "docx":
+        return "docx"
+    if mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation" or ext == "pptx":
+        return "pptx"
+    if mime_type == "application/pdf" or ext == "pdf":
+        return "pdf"
+    return "text"
+
+
+def _extract_file_content(content_bytes: bytes, mime_type: str, filename: str, max_chars: int) -> dict:
+    """파일 바이트를 메모리 내에서 텍스트로 추출합니다 (디스크 저장 없음)."""
+    from io import BytesIO
+    file_type = _file_type_from_meta(mime_type, filename)
+    raw_text = ""
+    if file_type == "xlsx":
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(BytesIO(content_bytes), data_only=True, read_only=True)
+            parts = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                parts.append(f"=== Sheet: {sheet_name} ===")
+                for row in ws.iter_rows(values_only=True):
+                    row_vals = [str(c) if c is not None else "" for c in row]
+                    if any(v.strip() for v in row_vals):
+                        parts.append("\t".join(row_vals))
+            raw_text = "\n".join(parts)
+        except Exception as e:
+            return {"content": f"[Excel 추출 실패: {e}]", "file_type": "xlsx", "truncated": False, "original_length": 0}
+    elif file_type == "docx":
+        try:
+            from docx import Document
+            doc = Document(BytesIO(content_bytes))
+            raw_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            return {"content": f"[Word 추출 실패: {e}]", "file_type": "docx", "truncated": False, "original_length": 0}
+    elif file_type == "pptx":
+        try:
+            from pptx import Presentation
+            prs = Presentation(BytesIO(content_bytes))
+            parts = []
+            for i, slide in enumerate(prs.slides, 1):
+                parts.append(f"=== Slide {i} ===")
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            txt = para.text.strip()
+                            if txt:
+                                parts.append(txt)
+            raw_text = "\n".join(parts)
+        except Exception as e:
+            return {"content": f"[PowerPoint 추출 실패: {e}]", "file_type": "pptx", "truncated": False, "original_length": 0}
+    elif file_type == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(content_bytes))
+            parts = []
+            for i, page in enumerate(reader.pages, 1):
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    parts.append(f"=== Page {i} ===\n{txt}")
+            raw_text = "\n".join(parts)
+        except Exception as e:
+            return {"content": f"[PDF 추출 실패: {e}]", "file_type": "pdf", "truncated": False, "original_length": 0}
+    else:
+        try:
+            raw_text = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return {
+                "content": f"[바이너리 파일: {len(content_bytes):,} bytes — 텍스트 변환 불가]",
+                "file_type": "binary", "truncated": False, "original_length": len(content_bytes),
+            }
+    original_length = len(raw_text)
+    truncated = original_length > max_chars
+    content = raw_text[:max_chars] if truncated else raw_text
+    return {"content": content, "file_type": file_type, "truncated": truncated, "original_length": original_length}
+
+
+async def _resolve_file_meta(uri: str, access_token: str) -> dict:
+    """Graph API URL 또는 웹 URL을 드라이브 메타데이터(drive_id, item_id, name, size, mime_type)로 해석합니다."""
+    import httpx
+    headers = {"Authorization": f"Bearer {access_token}"}
+    drive_id, item_id = _parse_drive_and_item(uri)
+    if drive_id:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}",
+                params={"$select": "id,name,size,file"},
+                headers=headers,
+            )
+        if resp.status_code != 200:
+            return {"error": f"파일 메타데이터 조회 실패: HTTP {resp.status_code}"}
+        data = resp.json()
+        return {
+            "drive_id": drive_id,
+            "item_id": data.get("id", item_id),
+            "name": data.get("name", ""),
+            "size": data.get("size") or 0,
+            "mime_type": (data.get("file") or {}).get("mimeType", ""),
+        }
+    encoded = _encode_sharing_url(uri)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+            params={"$select": "id,name,size,file,parentReference"},
+            headers=headers,
+        )
+    if resp.status_code != 200:
+        return {"error": f"URL 해석 실패 (HTTP {resp.status_code}). 지원 형식: Graph API URL, SharePoint 파일 URL, OneDrive 공유 링크."}
+    data = resp.json()
+    parent = data.get("parentReference") or {}
+    return {
+        "drive_id": parent.get("driveId"),
+        "item_id": data.get("id"),
+        "name": data.get("name", ""),
+        "size": data.get("size") or 0,
+        "mime_type": (data.get("file") or {}).get("mimeType", ""),
+    }
+
+
+def register_ms365_read_tools(mcp):
+    """MS365 Graph API 읽기 도구 7개를 MCP 서버에 등록합니다.
+
+    도구는 항상 등록되지만, 각 도구 호출 시 로그인 여부를 확인합니다.
+    미로그인 시 ms365_login 도구를 먼저 호출하도록 안내합니다.
+    """
+    from ms365.auth import get_graph_client, get_user_email, fetch_user_profile, require_auth, get_access_token
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R1: Teams 채팅 메시지 키워드 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": False})
+    async def chat_message_search(
+        query: Annotated[str, Field(min_length=1, description="검색 키워드")],
+        team_id: Annotated[str, Field(description="Teams 팀 ID (지정 시 해당 채널에서만 검색)")] = "",
+        channel_id: Annotated[str, Field(description="Teams 채널 ID (team_id와 함께 지정)")] = "",
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 10)")] = 10,
+    ) -> dict:
+        """Teams 채널 및 채팅 메시지를 키워드로 검색합니다.
+        - team_id + channel_id 지정: 해당 채널 메시지에서 키워드 필터링 (ChannelMessage.Read.All 필요)
+        - 미지정: Graph Search API로 접근 가능한 전체 chatMessage 검색 (Chat.ReadWrite 필요)
+        ms365_login으로 로그인 후 사용하세요.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        # ── 특정 채널 지정 검색 ─────────────────────────────────
+        if team_id and channel_id:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+                        params={"$top": min(limit * 3, 50)},
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                kw = query.lower()
+                messages_out = []
+                for msg in data.get("value", []):
+                    body = (msg.get("body") or {}).get("content") or ""
+                    if kw not in body.lower():
+                        continue
+                    sender = (msg.get("from") or {})
+                    messages_out.append({
+                        "id": msg.get("id"),
+                        "sender": (sender.get("user") or {}).get("displayName"),
+                        "created_at": msg.get("createdDateTime"),
+                        "body": body[:500],
+                        "message_type": msg.get("messageType"),
+                        "web_url": msg.get("webUrl"),
+                    })
+                    if len(messages_out) >= limit:
+                        break
+
+                return {
+                    "success": True,
+                    "query": query,
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "count": len(messages_out),
+                    "messages": messages_out,
+                }
+            except httpx.HTTPStatusError as e:
+                log.error("chat_message_search(channel) HTTP 오류: %s", e.response.text)
+                return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+            except Exception as e:
+                log.error("chat_message_search(channel) 실패: %s", e)
+                return {"success": False, "message": str(e)}
+
+        # ── Graph Search API — chatMessage 전체 검색 ────────────
+        try:
+            search_body = {
+                "requests": [{
+                    "entityTypes": ["chatMessage"],
+                    "query": {"queryString": query},
+                    "from": 0,
+                    "size": limit,
+                }]
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://graph.microsoft.com/v1.0/search/query",
+                    json=search_body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            messages_out = []
+            for response_item in data.get("value", []):
+                for hits_container in response_item.get("hitsContainers", []):
+                    for hit in hits_container.get("hits", []):
+                        res = hit.get("resource", {})
+                        messages_out.append({
+                            "id": res.get("id"),
+                            "sender": (res.get("from") or {}).get("user", {}).get("displayName"),
+                            "created_at": res.get("createdDateTime"),
+                            "body": (res.get("body") or {}).get("content", "")[:500],
+                            "channel_id": res.get("channelIdentity", {}).get("channelId"),
+                            "team_id": res.get("channelIdentity", {}).get("teamId"),
+                            "web_url": res.get("webUrl"),
+                        })
+                        if len(messages_out) >= limit:
+                            break
+
+            return {
+                "success": True,
+                "query": query,
+                "search_scope": "전체 (Graph Search API)",
+                "count": len(messages_out),
+                "messages": messages_out,
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("chat_message_search(search) HTTP 오류: %s", e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("chat_message_search(search) 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R2: 회의 가능 시간 조회 (getSchedule)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def find_meeting_availability(
+        attendees: Annotated[List[str], Field(description="스케줄 조회 대상 이메일 목록")],
+        start: Annotated[str, Field(
+            pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$",
+            description="조회 시작 시간 ISO8601 (예: 2026-04-23T09:00:00, KST 기준)",
+        )],
+        end: Annotated[str, Field(
+            pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$",
+            description="조회 종료 시간 ISO8601 (예: 2026-04-23T18:00:00, KST 기준)",
+        )],
+        interval_minutes: Annotated[int, Field(ge=5, le=60, description="가용 시간 슬롯 간격(분). 기본 30")] = 30,
+        calendar_owner: Annotated[str, Field(description="getSchedule 호출 주체 이메일 (비우면 로그인 계정)")] = "",
+    ) -> dict:
+        """참석자들의 캘린더 가용 시간을 조회합니다 (Graph API getSchedule 사용).
+        availability_view 필드의 각 문자: 0=Free, 1=Tentative, 2=Busy, 3=OOF, 4=WorkingElsewhere.
+        Azure AD 앱에 Calendars.Read Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        graph = get_graph_client()
+        await fetch_user_profile()
+        owner = calendar_owner or get_user_email()
+        try:
+            from msgraph.generated.models.date_time_time_zone import DateTimeTimeZone
+            from msgraph.generated.users.item.calendar.get_schedule.get_schedule_post_request_body import (
+                GetSchedulePostRequestBody,
+            )
+
+            start_dt = DateTimeTimeZone()
+            start_dt.date_time = start
+            start_dt.time_zone = "Asia/Seoul"
+
+            end_dt = DateTimeTimeZone()
+            end_dt.date_time = end
+            end_dt.time_zone = "Asia/Seoul"
+
+            body = GetSchedulePostRequestBody()
+            body.schedules = attendees
+            body.start_time = start_dt
+            body.end_time = end_dt
+            body.availability_view_interval = interval_minutes
+
+            if calendar_owner:
+                result = await graph.users.by_user_id(owner).calendar.get_schedule.post(body)
+            else:
+                result = await graph.me.calendar.get_schedule.post(body)
+
+            schedules_out = []
+            for s in (result.value or []):
+                items_out = []
+                for item in (s.schedule_items or []):
+                    items_out.append({
+                        "status": item.status.value if item.status else None,
+                        "start": item.start.date_time if item.start else None,
+                        "end": item.end.date_time if item.end else None,
+                        "subject": item.subject,
+                    })
+                schedules_out.append({
+                    "email": s.schedule_id,
+                    "availability_view": s.availability_view,
+                    "schedule_items": items_out,
+                    "error": s.error.message if s.error else None,
+                })
+
+            return {
+                "success": True,
+                "start": start,
+                "end": end,
+                "interval_minutes": interval_minutes,
+                "schedules": schedules_out,
+            }
+        except Exception as e:
+            log.error("find_meeting_availability 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R3: Outlook 캘린더 일정 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def outlook_calendar_search(
+        query: Annotated[str, Field(description="검색 키워드 (비우면 날짜 범위 전체 조회)")] = "",
+        start: Annotated[str, Field(description="조회 시작 ISO8601 (예: 2026-04-23T00:00:00). 비우면 오늘 자정")] = "",
+        end: Annotated[str, Field(description="조회 종료 ISO8601 (예: 2026-04-30T23:59:59). 비우면 start+7일")] = "",
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 10)")] = 10,
+        calendar_owner: Annotated[str, Field(description="캘린더 소유자 이메일 (비우면 로그인 계정)")] = "",
+    ) -> dict:
+        """Outlook 캘린더 일정을 검색합니다.
+        날짜 범위 지정 시 calendarView, 키워드만 지정 시 events?$search를 사용합니다.
+        둘 다 지정 시 날짜 범위로 가져온 후 Python에서 제목 키워드 필터링합니다.
+        Azure AD 앱에 Calendars.Read Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        graph = get_graph_client()
+        await fetch_user_profile()
+        owner = calendar_owner or get_user_email()
+        try:
+            from datetime import datetime, timedelta
+            from zoneinfo import ZoneInfo
+
+            KST = ZoneInfo("Asia/Seoul")
+            now = datetime.now(KST)
+            events_raw = []
+
+            if start or (not query):
+                # calendarView: 날짜 범위 기반 조회
+                if not start:
+                    start = now.strftime("%Y-%m-%dT00:00:00")
+                if not end:
+                    start_dt_obj = datetime.fromisoformat(start)
+                    end = (start_dt_obj + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59")
+
+                from msgraph.generated.users.item.calendar_view.calendar_view_request_builder import (
+                    CalendarViewRequestBuilder,
+                )
+
+                # calendarView requires ISO 8601 with UTC offset; append KST offset if absent
+                def _kst(dt_str: str) -> str:
+                    return dt_str if ("+" in dt_str or "Z" in dt_str) else dt_str + "+09:00"
+
+                qp = CalendarViewRequestBuilder.CalendarViewRequestBuilderGetQueryParameters(
+                    start_date_time=_kst(start),
+                    end_date_time=_kst(end),
+                    top=limit,
+                    select=["id", "subject", "start", "end", "location",
+                            "attendees", "bodyPreview", "isAllDay"],
+                    orderby=["start/dateTime asc"],
+                )
+                config = CalendarViewRequestBuilder.CalendarViewRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if calendar_owner:
+                    result = await graph.users.by_user_id(owner).calendar_view.get(
+                        request_configuration=config
+                    )
+                else:
+                    result = await graph.me.calendar_view.get(
+                        request_configuration=config
+                    )
+                events_raw = result.value or []
+
+                # 키워드가 함께 지정된 경우 Python에서 제목 필터링
+                if query:
+                    events_raw = [ev for ev in events_raw if query.lower() in (ev.subject or "").lower()]
+
+            else:
+                # events?$search: 키워드 전용 검색 ($search와 $orderby 동시 사용 불가)
+                from msgraph.generated.users.item.events.events_request_builder import (
+                    EventsRequestBuilder,
+                )
+
+                qp = EventsRequestBuilder.EventsRequestBuilderGetQueryParameters(
+                    search=f'"{query}"',
+                    top=limit,
+                    select=["id", "subject", "start", "end", "location",
+                            "bodyPreview", "isAllDay"],
+                )
+                config = EventsRequestBuilder.EventsRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if calendar_owner:
+                    result = await graph.users.by_user_id(owner).events.get(
+                        request_configuration=config
+                    )
+                else:
+                    result = await graph.me.events.get(
+                        request_configuration=config
+                    )
+                events_raw = result.value or []
+
+            events_out = []
+            for ev in events_raw:
+                attendee_list = []
+                for att in (ev.attendees or []):
+                    if att.email_address:
+                        attendee_list.append(att.email_address.address)
+                events_out.append({
+                    "id": ev.id,
+                    "subject": ev.subject,
+                    "start": ev.start.date_time if ev.start else None,
+                    "end": ev.end.date_time if ev.end else None,
+                    "location": ev.location.display_name if ev.location else None,
+                    "body_preview": ev.body_preview,
+                    "is_all_day": ev.is_all_day,
+                    "attendees": attendee_list,
+                })
+
+            return {
+                "success": True,
+                "owner": owner,
+                "count": len(events_out),
+                "events": events_out,
+            }
+        except Exception as e:
+            log.error("outlook_calendar_search 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R4: Outlook 이메일 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def outlook_email_search(
+        query: Annotated[str, Field(min_length=1, description="KQL 검색 쿼리 (예: '회의' 또는 'subject:보고서 from:boss@royal.co.kr')")],
+        folder: Annotated[str, Field(description="메일 폴더명 (inbox / sentitems / drafts). 비우면 전체 메일함")] = "",
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 10)")] = 10,
+        mailbox_owner: Annotated[str, Field(description="메일박스 소유자 이메일 (비우면 로그인 계정)")] = "",
+    ) -> dict:
+        """Outlook 이메일을 KQL 키워드로 검색합니다.
+        $search와 $orderby는 동시 사용이 불가능하므로 결과 순서는 Graph API 기본값을 따릅니다.
+        Azure AD 앱에 Mail.Read Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        graph = get_graph_client()
+        await fetch_user_profile()
+        owner = mailbox_owner or get_user_email()
+        select_fields = ["id", "subject", "from", "receivedDateTime",
+                         "bodyPreview", "isRead", "hasAttachments", "webLink"]
+        try:
+            if folder:
+                from msgraph.generated.users.item.mail_folders.item.messages.messages_request_builder import (
+                    MessagesRequestBuilder as FolderMsgBuilder,
+                )
+                qp = FolderMsgBuilder.MessagesRequestBuilderGetQueryParameters(
+                    search=f'"{query}"',
+                    top=limit,
+                    select=select_fields,
+                )
+                config = FolderMsgBuilder.MessagesRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if mailbox_owner:
+                    result = await (
+                        graph.users.by_user_id(owner)
+                        .mail_folders.by_mail_folder_id(folder)
+                        .messages.get(request_configuration=config)
+                    )
+                else:
+                    result = await (
+                        graph.me
+                        .mail_folders.by_mail_folder_id(folder)
+                        .messages.get(request_configuration=config)
+                    )
+            else:
+                from msgraph.generated.users.item.messages.messages_request_builder import (
+                    MessagesRequestBuilder,
+                )
+                qp = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+                    search=f'"{query}"',
+                    top=limit,
+                    select=select_fields,
+                )
+                config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if mailbox_owner:
+                    result = await graph.users.by_user_id(owner).messages.get(
+                        request_configuration=config
+                    )
+                else:
+                    result = await graph.me.messages.get(
+                        request_configuration=config
+                    )
+
+            messages_out = []
+            for msg in (result.value or []):
+                messages_out.append({
+                    "id": msg.id,
+                    "subject": msg.subject,
+                    "from": (
+                        msg.from_.email_address.address
+                        if msg.from_ and msg.from_.email_address else None
+                    ),
+                    "received_at": (
+                        msg.received_date_time.isoformat()
+                        if msg.received_date_time else None
+                    ),
+                    "body_preview": msg.body_preview,
+                    "is_read": msg.is_read,
+                    "has_attachments": msg.has_attachments,
+                    "web_link": msg.web_link,
+                })
+
+            return {
+                "success": True,
+                "owner": owner,
+                "folder": folder or "all",
+                "count": len(messages_out),
+                "messages": messages_out,
+            }
+        except Exception as e:
+            log.error("outlook_email_search 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R5: 리소스 URI 읽기 (메일 본문 / 일정 상세 / 파일 내용)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def read_resource(
+        uri: Annotated[str, Field(description=(
+            "읽을 리소스 식별자. "
+            "메일: outlook_email_search 반환 'id' 값. "
+            "일정: outlook_calendar_search 반환 'id' 값. "
+            "파일: Graph API URL (sharepoint_search 반환 'graph_url'), "
+            "SharePoint 브라우저 URL, OneDrive 공유 링크, Teams 파일 링크 모두 지원."
+        ))],
+        resource_type: Annotated[str, Field(description="리소스 유형: mail / calendar_event / file. 비우면 자동 추론")] = "",
+        owner: Annotated[str, Field(description="리소스 소유자 이메일 (mail/calendar_event 유형에 사용. 비우면 로그인 계정)")] = "",
+        max_chars: Annotated[int, Field(ge=1000, le=200000, description="파일 유형에서 반환할 최대 문자 수 (기본 50000)")] = 50000,
+    ) -> dict:
+        """메일 본문·일정 상세·파일 내용을 읽어 반환합니다.
+        파일은 xlsx/docx/pptx/pdf/텍스트를 메모리 내에서 추출합니다(디스크 저장 없음).
+        SharePoint 브라우저 URL, OneDrive 공유 링크, Teams 파일 링크도 직접 입력 가능합니다.
+        Azure AD 앱에 Mail.Read / Calendars.Read / Files.Read.All Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        graph = get_graph_client()
+        await fetch_user_profile()
+        resource_owner = owner or get_user_email()
+        uri_lower = uri.lower()
+        try:
+            # 리소스 유형 자동 추론
+            rtype = resource_type.lower()
+            if not rtype:
+                if "calendar" in uri_lower or "/events/" in uri_lower:
+                    rtype = "calendar_event"
+                elif "/drives/" in uri_lower or "/items/" in uri_lower:
+                    rtype = "file"
+                else:
+                    rtype = "mail"
+
+            if rtype == "mail":
+                msg_id = _extract_id_from_uri(uri)
+                from msgraph.generated.users.item.messages.item.message_item_request_builder import (
+                    MessageItemRequestBuilder,
+                )
+                qp = MessageItemRequestBuilder.MessageItemRequestBuilderGetQueryParameters(
+                    select=["id", "subject", "from", "toRecipients", "ccRecipients",
+                            "receivedDateTime", "body", "isRead", "hasAttachments", "webLink"]
+                )
+                config = MessageItemRequestBuilder.MessageItemRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if owner:
+                    msg = await (
+                        graph.users.by_user_id(resource_owner)
+                        .messages.by_message_id(msg_id)
+                        .get(request_configuration=config)
+                    )
+                else:
+                    msg = await (
+                        graph.me
+                        .messages.by_message_id(msg_id)
+                        .get(request_configuration=config)
+                    )
+                to_list = [
+                    r.email_address.address
+                    for r in (msg.to_recipients or [])
+                    if r.email_address
+                ]
+                cc_list = [
+                    r.email_address.address
+                    for r in (msg.cc_recipients or [])
+                    if r.email_address
+                ]
+                return {
+                    "success": True,
+                    "type": "mail",
+                    "id": msg.id,
+                    "subject": msg.subject,
+                    "from": (
+                        msg.from_.email_address.address
+                        if msg.from_ and msg.from_.email_address else None
+                    ),
+                    "to": to_list,
+                    "cc": cc_list,
+                    "received_at": (
+                        msg.received_date_time.isoformat()
+                        if msg.received_date_time else None
+                    ),
+                    "body": msg.body.content if msg.body else None,
+                    "body_type": (
+                        msg.body.content_type.value
+                        if msg.body and msg.body.content_type else None
+                    ),
+                    "is_read": msg.is_read,
+                    "has_attachments": msg.has_attachments,
+                    "web_link": msg.web_link,
+                }
+
+            elif rtype == "calendar_event":
+                event_id = _extract_id_from_uri(uri)
+                from msgraph.generated.users.item.events.item.event_item_request_builder import (
+                    EventItemRequestBuilder,
+                )
+                qp = EventItemRequestBuilder.EventItemRequestBuilderGetQueryParameters(
+                    select=["id", "subject", "start", "end", "location", "attendees",
+                            "body", "isAllDay", "isOnlineMeeting", "onlineMeetingUrl"]
+                )
+                config = EventItemRequestBuilder.EventItemRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                if owner:
+                    ev = await (
+                        graph.users.by_user_id(resource_owner)
+                        .events.by_event_id(event_id)
+                        .get(request_configuration=config)
+                    )
+                else:
+                    ev = await (
+                        graph.me
+                        .events.by_event_id(event_id)
+                        .get(request_configuration=config)
+                    )
+                attendee_list = []
+                for att in (ev.attendees or []):
+                    if att.email_address:
+                        attendee_list.append({
+                            "email": att.email_address.address,
+                            "name": att.email_address.name,
+                            "status": (
+                                att.status.response.value
+                                if att.status and att.status.response else None
+                            ),
+                        })
+                return {
+                    "success": True,
+                    "type": "calendar_event",
+                    "id": ev.id,
+                    "subject": ev.subject,
+                    "start": ev.start.date_time if ev.start else None,
+                    "end": ev.end.date_time if ev.end else None,
+                    "location": ev.location.display_name if ev.location else None,
+                    "body": ev.body.content if ev.body else None,
+                    "body_type": (
+                        ev.body.content_type.value
+                        if ev.body and ev.body.content_type else None
+                    ),
+                    "is_all_day": ev.is_all_day,
+                    "is_online_meeting": ev.is_online_meeting,
+                    "online_meeting_url": ev.online_meeting_url,
+                    "attendees": attendee_list,
+                }
+
+            elif rtype == "file":
+                import httpx as _httpx
+                token = get_access_token()
+                if not token:
+                    return {"success": False, "message": "액세스 토큰을 가져올 수 없습니다. ms365_login으로 다시 로그인해주세요."}
+
+                meta = await _resolve_file_meta(uri, token)
+                if "error" in meta:
+                    return {"success": False, "message": meta["error"]}
+
+                file_size = meta.get("size", 0)
+                MAX_BYTES = 20 * 1024 * 1024  # 20MB
+                if file_size > MAX_BYTES:
+                    return {
+                        "success": False,
+                        "message": f"파일 크기({file_size / 1024 / 1024:.1f}MB)가 20MB 제한을 초과합니다.",
+                        "filename": meta.get("name"),
+                        "size": file_size,
+                    }
+
+                drive_id = meta.get("drive_id")
+                item_id = meta.get("item_id")
+                if not drive_id or not item_id:
+                    return {"success": False, "message": "파일 드라이브 정보를 확인할 수 없습니다."}
+
+                async with _httpx.AsyncClient(timeout=60) as client:
+                    dl_resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
+                        headers={"Authorization": f"Bearer {token}"},
+                        follow_redirects=True,
+                    )
+                if dl_resp.status_code != 200:
+                    return {"success": False, "message": f"파일 다운로드 실패: HTTP {dl_resp.status_code}"}
+
+                content_bytes = dl_resp.content
+                if not content_bytes:
+                    return {"success": True, "type": "file", "uri": uri, "filename": meta.get("name"), "content": ""}
+
+                extracted = _extract_file_content(
+                    content_bytes,
+                    meta.get("mime_type", ""),
+                    meta.get("name", ""),
+                    max_chars,
+                )
+                return {
+                    "success": True,
+                    "type": "file",
+                    "uri": uri,
+                    "filename": meta.get("name"),
+                    "size": file_size,
+                    "file_type": extracted["file_type"],
+                    "content": extracted["content"],
+                    "truncated": extracted["truncated"],
+                    "original_length": extracted["original_length"],
+                }
+
+            else:
+                return {"success": False, "message": f"지원하지 않는 리소스 유형: '{resource_type}'. mail / calendar_event / file 중 하나를 입력하세요."}
+
+        except Exception as e:
+            log.error("read_resource 실패 (uri=%s): %s", uri, e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R6: SharePoint / OneDrive 파일 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def sharepoint_search(
+        query: Annotated[str, Field(min_length=1, description="검색 키워드 (예: 'aa', '보고서')")],
+        site_id: Annotated[str, Field(description="SharePoint 사이트 ID. 비우면 로그인 사용자의 OneDrive + SharePoint 전체에서 검색합니다.")] = "",
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 10)")] = 10,
+    ) -> dict:
+        """파일과 폴더를 키워드로 검색합니다.
+
+        - site_id 없음: Graph 전역 Search API(/search/query) + OneDrive(/me/drive) 병렬 검색.
+          로그인 사용자가 접근 가능한 SharePoint 및 OneDrive 전체를 탐색합니다.
+        - site_id 있음: 해당 사이트의 드라이브에서만 검색합니다.
+
+        반환된 'graph_url'을 read_resource 도구에 전달하면 파일 내용을 읽을 수 있습니다.
+        Azure AD 앱에 Files.Read.All, Sites.Read.All Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        graph = get_graph_client()
+
+        # ── site_id 있음: 기존 사이트별 드라이브 검색 ─────────────
+        if site_id:
+            try:
+                drive = await graph.sites.by_site_id(site_id).drive.get()
+                drive_id = drive.id
+                from msgraph.generated.drives.item.search_with_q.search_with_q_request_builder import (
+                    SearchWithQRequestBuilder,
+                )
+                qp = SearchWithQRequestBuilder.SearchWithQRequestBuilderGetQueryParameters(
+                    top=limit,
+                    select=["id", "name", "size", "webUrl", "lastModifiedDateTime",
+                            "folder", "file", "parentReference"],
+                )
+                cfg = SearchWithQRequestBuilder.SearchWithQRequestBuilderGetRequestConfiguration(
+                    query_parameters=qp
+                )
+                result = await graph.drives.by_drive_id(drive_id).search_with_q(query).get(
+                    request_configuration=cfg
+                )
+                items_out = []
+                for item in (result.value or []):
+                    items_out.append({
+                        "id": item.id,
+                        "name": item.name,
+                        "size": item.size,
+                        "web_url": item.web_url,
+                        "graph_url": f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item.id}" if item.id else None,
+                        "last_modified": item.last_modified_date_time.isoformat() if item.last_modified_date_time else None,
+                        "is_folder": item.folder is not None,
+                        "mime_type": item.file.mime_type if item.file else None,
+                        "source": "site",
+                        "site_id": site_id,
+                    })
+                    if len(items_out) >= limit:
+                        break
+                return {"success": True, "query": query, "site_id": site_id, "count": len(items_out), "items": items_out}
+            except Exception as e:
+                log.error("sharepoint_search(site) 실패: %s", e)
+                return {"success": False, "message": str(e)}
+
+        # ── site_id 없음: 전역 Search API + OneDrive httpx 직접 호출 ───
+        import httpx
+
+        items_out = []
+        errors = []
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        # 1) Graph 전역 Search API — driveItem 엔티티
+        try:
+            search_body = {
+                "requests": [{
+                    "entityTypes": ["driveItem"],
+                    "query": {"queryString": query},
+                    "fields": ["id", "name", "size", "webUrl", "lastModifiedDateTime",
+                               "parentReference", "file", "folder"],
+                    "from": 0,
+                    "size": limit,
+                }]
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://graph.microsoft.com/v1.0/search/query",
+                    json=search_body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            for response_item in data.get("value", []):
+                for hit in response_item.get("hitsContainers", []):
+                    for h in hit.get("hits", []):
+                        res = h.get("resource", {})
+                        parent = res.get("parentReference", {})
+                        drive_id = parent.get("driveId")
+                        item_id = res.get("id")
+                        items_out.append({
+                            "id": item_id,
+                            "name": res.get("name"),
+                            "size": res.get("size"),
+                            "web_url": res.get("webUrl"),
+                            "graph_url": f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}" if drive_id and item_id else None,
+                            "last_modified": res.get("lastModifiedDateTime"),
+                            "is_folder": "folder" in res,
+                            "site_id": parent.get("siteId"),
+                            "drive_id": drive_id,
+                            "source": "global_search",
+                        })
+                        if len(items_out) >= limit:
+                            break
+            log.info("전역 Search API: %d건 반환", len(items_out))
+        except Exception as e:
+            log.warning("전역 Search API 실패: %s", e)
+            errors.append(f"전역검색: {e}")
+
+        # 2) OneDrive (/me/drive/root/search) — httpx 직접 호출
+        if len(items_out) < limit:
+            try:
+                remain = limit - len(items_out)
+                select = "id,name,size,webUrl,lastModifiedDateTime,folder,file,parentReference"
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/me/drive/root/search(q='{query}')",
+                        params={"$top": remain, "$select": select},
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    me_data = resp.json()
+
+                seen_ids = {i["id"] for i in items_out if i.get("id")}
+                for item in me_data.get("value", []):
+                    if item.get("id") in seen_ids:
+                        continue
+                    parent = item.get("parentReference", {})
+                    drive_id = parent.get("driveId")
+                    item_id = item.get("id")
+                    items_out.append({
+                        "id": item_id,
+                        "name": item.get("name"),
+                        "size": item.get("size"),
+                        "web_url": item.get("webUrl"),
+                        "graph_url": f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}" if drive_id and item_id else None,
+                        "last_modified": item.get("lastModifiedDateTime"),
+                        "is_folder": "folder" in item,
+                        "mime_type": item.get("file", {}).get("mimeType"),
+                        "site_id": parent.get("siteId"),
+                        "drive_id": drive_id,
+                        "source": "onedrive",
+                    })
+                    if len(items_out) >= limit:
+                        break
+                log.info("OneDrive 검색: %d건 추가", len([i for i in items_out if i.get("source") == "onedrive"]))
+            except Exception as e:
+                log.warning("OneDrive 검색 실패: %s", e)
+                errors.append(f"OneDrive: {e}")
+
+        return {
+            "success": True,
+            "query": query,
+            "search_scope": "global (SharePoint + OneDrive)" if not site_id else f"site:{site_id}",
+            "count": len(items_out),
+            "items": items_out,
+            **(({"warnings": errors}) if errors else {}),
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R7: SharePoint 폴더 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def sharepoint_folder_search(
+        query: Annotated[str, Field(min_length=1, description="검색 키워드")],
+        site_id: Annotated[str, Field(description="SharePoint 사이트 ID. 비우면 OneDrive + SharePoint 전체에서 폴더를 검색합니다.")] = "",
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 10)")] = 10,
+    ) -> dict:
+        """폴더만 키워드로 검색합니다. sharepoint_search와 동일 로직이나 폴더 항목만 반환합니다.
+        site_id 없으면 전역 검색, 있으면 해당 사이트에서만 검색합니다.
+        Azure AD 앱에 Files.Read.All, Sites.Read.All Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        # sharepoint_search(폴더 포함 전체) 결과에서 폴더만 필터링
+        result = await sharepoint_search(query=query, site_id=site_id, limit=limit * 5)
+        if not result.get("success"):
+            return result
+
+        folders = [i for i in result.get("items", []) if i.get("is_folder")][:limit]
+        return {
+            "success": True,
+            "query": query,
+            "search_scope": result.get("search_scope"),
+            "count": len(folders),
+            "folders": folders,
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R8: 임직원 / 조직 연락처 조회 (활성 사용자만)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def org_users_search(
+        query: Annotated[str, Field(description="검색어 (이름·부서·이메일). 비우면 활성 사용자 전체 목록을 반환합니다.")] = "",
+        include_contacts: Annotated[bool, Field(description="조직 연락처(/contacts)도 함께 조회할지 여부 (기본 False)")] = False,
+        limit: Annotated[int, Field(ge=1, le=200, description="최대 반환 건수 (기본 50)")] = 50,
+    ) -> dict:
+        """활성(Active) 임직원 목록을 조회하거나 이름·부서·이메일로 검색합니다.
+
+        - 비활성 계정(퇴직자 등)은 자동으로 제외됩니다 (accountEnabled = true).
+        - query 없음: 전체 활성 사용자 목록 반환 (limit 건)
+        - query 있음: displayName, department, mail 포함 여부로 필터링
+        - include_contacts=True: 조직 연락처(OrgContact)도 함께 반환
+        - 특정 인원 상세 조회는 org_user_detail 도구를 사용하세요.
+
+        Azure AD 앱에 다음 Delegated 권한이 필요합니다:
+          - User.Read.All      (임직원 조회, 관리자 동의 필요)
+          - OrgContact.Read.All (조직 연락처 조회, include_contacts=True 시)
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "ConsistencyLevel": "eventual",
+        }
+
+        select = "displayName,department,jobTitle,businessPhones,mobilePhone,mail,accountEnabled"
+        users_out: list = []
+        errors: list = []
+
+        # ── 1) /v1.0/users 조회 (활성 사용자만) ──────────────────
+        try:
+            if query:
+                # $search + $filter 동시 사용 불가 → over-fetch 후 코드 필터링
+                uparams: dict = {
+                    "$select": select,
+                    "$top": min(limit * 3, 200),
+                    "$search": f'"displayName:{query}" OR "mail:{query}" OR "department:{query}"',
+                    "$count": "true",
+                }
+            else:
+                uparams = {
+                    "$select": select,
+                    "$top": limit,
+                    "$filter": "accountEnabled eq true",
+                    "$orderby": "displayName",
+                    "$count": "true",
+                }
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    "https://graph.microsoft.com/v1.0/users",
+                    params=uparams,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            for u in data.get("value", []):
+                if not u.get("accountEnabled", True):
+                    continue
+                users_out.append({
+                    "type": "user",
+                    "display_name": u.get("displayName"),
+                    "job_title": u.get("jobTitle"),
+                    "department": u.get("department"),
+                    "mail": u.get("mail"),
+                    "business_phones": u.get("businessPhones", []),
+                    "mobile_phone": u.get("mobilePhone"),
+                })
+                if len(users_out) >= limit:
+                    break
+            log.info("임직원 조회 (활성): %d건 반환", len(users_out))
+        except Exception as e:
+            log.warning("임직원 조회 실패: %s", e)
+            errors.append(f"users: {e}")
+
+        # ── 2) /v1.0/contacts — 선택 옵션 ─────────────────────
+        contacts_out: list = []
+        if include_contacts:
+            try:
+                cparams: dict = {
+                    "$select": "displayName,department,jobTitle,businessPhones,mobilePhone,emailAddresses",
+                    "$top": limit,
+                }
+                if query:
+                    cparams["$search"] = f'"displayName:{query}"'
+
+                async with httpx.AsyncClient(timeout=30) as client:
+                    cresp = await client.get(
+                        "https://graph.microsoft.com/v1.0/contacts",
+                        params=cparams,
+                        headers=headers,
+                    )
+                    cresp.raise_for_status()
+                    cdata = cresp.json()
+
+                for c in cdata.get("value", []):
+                    emails = [e.get("address") for e in c.get("emailAddresses", []) if e.get("address")]
+                    contacts_out.append({
+                        "type": "org_contact",
+                        "display_name": c.get("displayName"),
+                        "job_title": c.get("jobTitle"),
+                        "department": c.get("department"),
+                        "mail": emails[0] if emails else None,
+                        "business_phones": c.get("businessPhones", []),
+                        "mobile_phone": c.get("mobilePhone"),
+                    })
+                log.info("조직 연락처 조회: %d건 반환", len(contacts_out))
+            except Exception as e:
+                log.warning("조직 연락처 조회 실패: %s", e)
+                errors.append(f"contacts: {e}")
+
+        return {
+            "success": True,
+            "query": query or "(전체 활성 사용자)",
+            "user_count": len(users_out),
+            "contact_count": len(contacts_out),
+            "users": users_out,
+            **({"contacts": contacts_out} if include_contacts else {}),
+            **({"warnings": errors} if errors else {}),
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R9: 특정 임직원 상세 정보 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+
+    async def org_user_detail(
+        identifier: Annotated[str, Field(min_length=1, description="조회할 사용자 식별자. 이메일(mail), UPN(userPrincipalName), 이름(displayName) 모두 허용됩니다. 예: 'kjr@iroyal.kr', '김정렴'")],
+    ) -> dict:
+        """특정 임직원 한 명의 상세 정보를 조회합니다.
+
+        - 이메일/UPN 입력 시: /v1.0/users/{id} 직접 조회 (정확·빠름)
+        - 이름 입력 시: displayName으로 검색 후 첫 번째 활성 사용자 반환
+
+        반환 정보: 이름, 직함, 부서, 이메일, 사내전화, 휴대전화
+
+        Azure AD 앱에 User.Read.All Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "ConsistencyLevel": "eventual",
+        }
+
+        select = "displayName,department,jobTitle,businessPhones,mobilePhone,mail,accountEnabled"
+
+        user_data = None
+
+        # ── 이메일/UPN이면 직접 조회, 이름이면 $search ─────────
+        is_email_or_upn = "@" in identifier
+        async with httpx.AsyncClient(timeout=30) as client:
+            if is_email_or_upn:
+                resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/users/{identifier}",
+                    params={"$select": select},
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    user_data = resp.json()
+                else:
+                    return {
+                        "success": False,
+                        "message": f"사용자를 찾을 수 없습니다: {identifier} (HTTP {resp.status_code})",
+                    }
+            else:
+                resp = await client.get(
+                    "https://graph.microsoft.com/v1.0/users",
+                    params={
+                        "$select": select,
+                        "$search": f'"displayName:{identifier}"',
+                        "$count": "true",
+                        "$top": 10,
+                    },
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    return {
+                        "success": False,
+                        "message": f"사용자 검색 실패: HTTP {resp.status_code} — {resp.text[:200]}",
+                    }
+                results = resp.json().get("value", [])
+                active = [u for u in results if u.get("accountEnabled", True)]
+                if not active:
+                    return {
+                        "success": False,
+                        "message": f"'{identifier}' 이름과 일치하는 활성 사용자가 없습니다.",
+                        "candidates": len(results),
+                    }
+                user_data = active[0]
+                if len(active) > 1:
+                    log.info("이름 '%s' 검색 결과 %d명 — 첫 번째 선택", identifier, len(active))
+
+        if not user_data:
+            return {"success": False, "message": "사용자 데이터를 가져오지 못했습니다."}
+
+        return {
+            "success": True,
+            "identifier": identifier,
+            "user": {
+                "display_name": user_data.get("displayName"),
+                "job_title": user_data.get("jobTitle"),
+                "department": user_data.get("department"),
+                "mail": user_data.get("mail"),
+                "business_phones": user_data.get("businessPhones", []),
+                "mobile_phone": user_data.get("mobilePhone"),
+            },
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R10: MS365 팀 및 채널 검색
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channels_search(
+        team_name: Annotated[str, Field(description="검색할 팀 이름 (부분 일치). 비워두면 가입된 전체 팀 목록 반환")] = "",
+        channel_name: Annotated[str, Field(description="검색할 채널 이름 (부분 일치). 비워두면 검색된 팀의 전체 채널 반환")] = "",
+    ) -> dict:
+        """사용자가 가입한 Teams의 팀과 하위 채널을 이름으로 검색하여 ID를 조회합니다.
+        team_name이 비어있으면 사용자가 가입한 전체 팀 목록만 반환합니다.
+        team_name을 지정하면 해당 키워드가 포함된 팀들과 그 안의 채널 목록을 조회하여 반환합니다.
+        Azure AD 앱에 Team.ReadBasic.All, Channel.ReadBasic.All Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        teams_out = []
+        errors = []
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                # 1. 가입된 전체 팀 목록 조회
+                # GET /me/joinedTeams
+                teams_resp = await client.get(
+                    "https://graph.microsoft.com/v1.0/me/joinedTeams",
+                    headers=headers,
+                )
+                teams_resp.raise_for_status()
+                all_teams = teams_resp.json().get("value", [])
+
+                # 2. team_name 키워드로 필터링
+                if team_name:
+                    filtered_teams = [
+                        t for t in all_teams 
+                        if team_name.lower() in (t.get("displayName") or "").lower()
+                    ]
+                else:
+                    filtered_teams = all_teams
+
+                # 3. 채널 정보 조회 (team_name이 있을 때만 상세 조회, 없으면 팀 목록만 반환)
+                for t in filtered_teams:
+                    team_id = t.get("id")
+                    team_info = {
+                        "team_id": team_id,
+                        "display_name": t.get("displayName"),
+                        "description": t.get("description"),
+                        "channels": []
+                    }
+
+                    if team_name:
+                        try:
+                            channels_resp = await client.get(
+                                f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels",
+                                headers=headers,
+                            )
+                            if channels_resp.status_code == 200:
+                                channels_data = channels_resp.json().get("value", [])
+                                
+                                # channel_name 필터링
+                                if channel_name:
+                                    filtered_channels = [
+                                        c for c in channels_data
+                                        if channel_name.lower() in (c.get("displayName") or "").lower()
+                                    ]
+                                else:
+                                    filtered_channels = channels_data
+
+                                for c in filtered_channels:
+                                    team_info["channels"].append({
+                                        "channel_id": c.get("id"),
+                                        "display_name": c.get("displayName"),
+                                        "description": c.get("description"),
+                                    })
+                        except Exception as e:
+                            log.warning("팀(%s) 채널 조회 실패: %s", team_id, e)
+                            errors.append(f"channels for {team_id}: {e}")
+
+                    teams_out.append(team_info)
+
+            log.info("teams_channels_search: %d 팀 반환", len(teams_out))
+            return {
+                "success": True,
+                "team_name_query": team_name,
+                "channel_name_query": channel_name,
+                "team_count": len(teams_out),
+                "teams": teams_out,
+                **({"warnings": errors} if errors else {}),
+            }
+
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channels_search HTTP 오류: %s", e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": f"Graph API 오류: {e.response.text}"}
+        except Exception as e:
+            log.error("teams_channels_search 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R11: Teams 그룹 채팅방 메시지 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_group_chat_messages(
+        chat_id: Annotated[str, Field(description="그룹 채팅방 ID. 비워두면 내 그룹 채팅 목록을 반환합니다.")] = "",
+        date: Annotated[str, Field(
+            pattern=r"^(\d{4}-\d{2}-\d{2})?$",
+            description="조회 날짜 YYYY-MM-DD. 비우면 오늘",
+        )] = "",
+        limit: Annotated[int, Field(ge=1, le=100, description="최대 반환 건수 (기본 50)")] = 50,
+    ) -> dict:
+        """Teams 그룹 채팅방의 메시지를 날짜 기준으로 조회합니다.
+        - chat_id 없음: 내가 속한 그룹 채팅 목록을 반환합니다. (chat_id를 확인한 뒤 다시 호출하세요)
+        - chat_id 있음: 해당 채팅방의 지정 날짜 메시지를 조회합니다.
+        Azure AD 앱에 Chat.ReadWrite Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        KST = ZoneInfo("Asia/Seoul")
+
+        # ── 채팅방 목록 반환 ────────────────────────────────────
+        if not chat_id:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    # $expand=members 는 /me/chats 에서 미지원 → 목록만 가져온 뒤 멤버 별도 조회
+                    resp = await client.get(
+                        "https://graph.microsoft.com/v1.0/me/chats",
+                        params={
+                            "$select": "id,topic,chatType,createdDateTime,lastUpdatedDateTime",
+                            "$top": 50,
+                        },
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    # 그룹 채팅만 필터링 (chatType 값: oneOnOne | group | meeting)
+                    group_chats = [c for c in data.get("value", []) if c.get("chatType") == "group"]
+
+                    # 각 채팅방 멤버를 별도 조회
+                    chats_out = []
+                    for c in group_chats:
+                        members = []
+                        try:
+                            m_resp = await client.get(
+                                f"https://graph.microsoft.com/v1.0/chats/{c['id']}/members",
+                                params={"$select": "displayName,email"},
+                                headers=headers,
+                            )
+                            if m_resp.status_code == 200:
+                                members = [
+                                    m.get("displayName") or m.get("email", "")
+                                    for m in m_resp.json().get("value", [])
+                                ]
+                        except Exception:
+                            pass
+
+                        chats_out.append({
+                            "chat_id": c.get("id"),
+                            "topic": c.get("topic") or "(제목 없음)",
+                            "members": members,
+                            "last_updated": c.get("lastUpdatedDateTime"),
+                        })
+
+                return {
+                    "success": True,
+                    "message": "아래 chat_id 중 하나를 선택해 다시 호출하면 메시지를 조회할 수 있습니다.",
+                    "count": len(chats_out),
+                    "chats": chats_out,
+                }
+            except httpx.HTTPStatusError as e:
+                log.error("teams_group_chat_messages(list) HTTP 오류: %s", e.response.text)
+                return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+            except Exception as e:
+                log.error("teams_group_chat_messages(list) 실패: %s", e)
+                return {"success": False, "message": str(e)}
+
+        # ── 메시지 조회 ─────────────────────────────────────────
+        # /chats/{id}/messages 는 $filter=createdDateTime 미지원
+        # → $filter 없이 최신순으로 가져오며 페이지네이션, Python에서 날짜 필터링
+        target_date = date or datetime.now(KST).strftime("%Y-%m-%d")
+
+        try:
+            messages_out = []
+            next_url: str = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages"
+            next_params: dict | None = {"$top": 50}
+
+            async with httpx.AsyncClient(timeout=60) as client:
+                while next_url and len(messages_out) < limit:
+                    resp = await client.get(next_url, params=next_params, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    next_params = None  # 이후 페이지는 nextLink 자체에 파라미터 포함
+
+                    stop = False
+                    for msg in data.get("value", []):
+                        if msg.get("messageType") != "message":
+                            continue
+                        created_at = msg.get("createdDateTime") or ""
+                        msg_date = _to_kst_date(created_at)
+                        if msg_date > target_date:
+                            continue          # 대상 날짜보다 미래 메시지 → 스킵
+                        if not msg_date:
+                            continue          # 파싱 실패 → 스킵 (stop 하지 않음)
+                        if msg_date < target_date:
+                            stop = True       # 대상 날짜보다 과거 → 더 이상 페이지 불필요
+                            break
+                        sender_info = msg.get("from") or {}
+                        sender = (
+                            (sender_info.get("user") or {}).get("displayName")
+                            or (sender_info.get("application") or {}).get("displayName")
+                            or "알 수 없음"
+                        )
+                        body_content = (msg.get("body") or {}).get("content") or ""
+                        messages_out.append({
+                            "id": msg.get("id"),
+                            "sender": sender,
+                            "created_at": created_at,
+                            "body": body_content[:500],
+                            "attachments": len(msg.get("attachments") or []),
+                        })
+                        if len(messages_out) >= limit:
+                            stop = True
+                            break
+
+                    if stop:
+                        break
+                    next_url = data.get("@odata.nextLink", "")
+
+            messages_out.sort(key=lambda m: m["created_at"] or "")
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "date": target_date,
+                "count": len(messages_out),
+                "messages": messages_out,
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_group_chat_messages(messages) HTTP 오류: %s", e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_group_chat_messages(messages) 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R12: Teams 팀 채널 메시지 날짜 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channel_messages(
+        team_id: Annotated[str, Field(min_length=1, description="Teams 팀 ID (teams_channels_search 도구로 확인)")],
+        channel_id: Annotated[str, Field(min_length=1, description="Teams 채널 ID (teams_channels_search 도구로 확인)")],
+        date: Annotated[str, Field(
+            pattern=r"^(\d{4}-\d{2}-\d{2})?$",
+            description="조회 날짜 YYYY-MM-DD. 비우면 오늘",
+        )] = "",
+        limit: Annotated[int, Field(ge=1, le=100, description="최대 반환 건수 (기본 50)")] = 50,
+    ) -> dict:
+        """Teams 팀 채널의 메시지를 날짜 기준으로 조회합니다.
+        team_id와 channel_id는 teams_channels_search 도구로 먼저 확인하세요.
+        Azure AD 앱에 ChannelMessage.Read.All Delegated 권한 및 관리자 동의가 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        KST = ZoneInfo("Asia/Seoul")
+        target_date = date or datetime.now(KST).strftime("%Y-%m-%d")
+
+        # /teams/{id}/channels/{id}/messages 도 $filter=createdDateTime 미지원
+        # → 페이지네이션으로 최신순 수신 후 Python에서 날짜 필터링
+        try:
+            messages_out = []
+            next_url: str = (
+                f"https://graph.microsoft.com/v1.0/teams/{team_id}"
+                f"/channels/{channel_id}/messages"
+            )
+            next_params: dict | None = {"$top": 50}
+
+            async with httpx.AsyncClient(timeout=60) as client:
+                while next_url and len(messages_out) < limit:
+                    resp = await client.get(next_url, params=next_params, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    next_params = None
+
+                    stop = False
+                    for msg in data.get("value", []):
+                        if msg.get("messageType") != "message":
+                            continue
+                        created_at = msg.get("createdDateTime") or ""
+                        msg_date = _to_kst_date(created_at)
+                        if msg_date > target_date:
+                            continue
+                        if not msg_date:
+                            continue          # 파싱 실패 → 스킵 (stop 하지 않음)
+                        if msg_date < target_date:
+                            stop = True
+                            break
+                        sender_info = msg.get("from") or {}
+                        sender = (sender_info.get("user") or {}).get("displayName") or "알 수 없음"
+                        body_content = (msg.get("body") or {}).get("content") or ""
+                        messages_out.append({
+                            "id": msg.get("id"),
+                            "sender": sender,
+                            "created_at": created_at,
+                            "body": body_content[:500],
+                            "reactions": [r.get("reactionType") for r in (msg.get("reactions") or [])],
+                            "web_url": msg.get("webUrl"),
+                        })
+                        if len(messages_out) >= limit:
+                            stop = True
+                            break
+
+                    if stop:
+                        break
+                    next_url = data.get("@odata.nextLink", "")
+
+            messages_out.sort(key=lambda m: m["created_at"] or "")
+            return {
+                "success": True,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "date": target_date,
+                "count": len(messages_out),
+                "messages": messages_out,
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channel_messages HTTP 오류: %s", e.response.text)
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'ChannelMessage.Read.All' Delegated 권한과 "
+                        "관리자 동의가 필요합니다. Azure Portal에서 권한을 추가한 뒤 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_channel_messages 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R13: 이메일 첨부파일 읽기
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def read_email_attachment(
+        message_id: Annotated[str, Field(min_length=1, description="이메일 ID (outlook_email_search 반환 'id' 값)")],
+        attachment_id: Annotated[str, Field(description="첨부파일 ID. 비우면 첨부파일 목록을 반환합니다.")] = "",
+        owner: Annotated[str, Field(description="이메일 소유자 이메일. 비우면 로그인 계정.")] = "",
+        max_chars: Annotated[int, Field(ge=1000, le=200000, description="반환할 최대 문자 수 (기본 20000)")] = 20000,
+    ) -> dict:
+        """Outlook 이메일의 첨부파일을 읽습니다.
+
+        - attachment_id 없음: 이메일의 첨부파일 목록(id, name, size, content_type 등)을 반환합니다.
+          Graph API 제약상 목록 조회 시에는 attachment_type을 정확히 구분하지 못하고 기본값 'file'로 표시됩니다
+          (참조/아이템 첨부파일 여부는 attachment_id로 개별 조회해야 정확히 확인 가능).
+        - attachment_id 있음: 해당 첨부파일 내용을 추출하여 반환합니다.
+          xlsx/docx/pptx/pdf는 텍스트로 추출하고, 참조 첨부파일(OneDrive/SharePoint 링크)도 지원합니다.
+        Azure AD 앱에 Mail.ReadWrite Delegated 권한이 필요합니다.
+        """
+        import httpx as _httpx
+
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        await fetch_user_profile()
+        resource_owner = owner or get_user_email()
+        token = get_access_token()
+        if not token:
+            return {"success": False, "message": "액세스 토큰을 가져올 수 없습니다. ms365_login으로 다시 로그인해주세요."}
+
+        base_url = f"https://graph.microsoft.com/v1.0/users/{resource_owner}/messages/{message_id}/attachments"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            if not attachment_id:
+                # 첨부파일 목록 반환
+                async with _httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        base_url,
+                        params={"$select": "id,name,size,contentType,isInline"},
+                        headers=headers,
+                    )
+                if resp.status_code != 200:
+                    return {"success": False, "message": f"첨부파일 목록 조회 실패: HTTP {resp.status_code} — {resp.text[:300]}"}
+                items = resp.json().get("value", [])
+                attachments_out = []
+                for att in items:
+                    odata_type = att.get("@odata.type", "")
+                    att_type = "file"
+                    if "referenceAttachment" in odata_type:
+                        att_type = "reference"
+                    elif "itemAttachment" in odata_type:
+                        att_type = "item"
+                    attachments_out.append({
+                        "id": att.get("id"),
+                        "name": att.get("name"),
+                        "size": att.get("size"),
+                        "content_type": att.get("contentType"),
+                        "is_inline": att.get("isInline", False),
+                        "attachment_type": att_type,
+                        "source_url": att.get("sourceUrl"),  # referenceAttachment 전용
+                    })
+                return {
+                    "success": True,
+                    "message_id": message_id,
+                    "owner": resource_owner,
+                    "count": len(attachments_out),
+                    "attachments": attachments_out,
+                }
+
+            # 특정 첨부파일 내용 읽기
+            async with _httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{base_url}/{attachment_id}",
+                    headers=headers,
+                )
+            if resp.status_code != 200:
+                return {"success": False, "message": f"첨부파일 조회 실패: HTTP {resp.status_code}"}
+
+            att_data = resp.json()
+            odata_type = att_data.get("@odata.type", "")
+
+            if "itemAttachment" in odata_type:
+                return {
+                    "success": False,
+                    "message": "itemAttachment(이메일/일정 항목 첨부)는 현재 지원하지 않습니다. fileAttachment 또는 referenceAttachment만 읽을 수 있습니다.",
+                    "attachment_type": "item",
+                }
+
+            if "referenceAttachment" in odata_type:
+                source_url = att_data.get("sourceUrl", "")
+                if not source_url:
+                    return {"success": False, "message": "참조 첨부파일의 sourceUrl을 찾을 수 없습니다."}
+                meta = await _resolve_file_meta(source_url, token)
+                if "error" in meta:
+                    return {"success": False, "message": meta["error"], "source_url": source_url}
+
+                file_size = meta.get("size", 0)
+                MAX_BYTES = 20 * 1024 * 1024
+                if file_size > MAX_BYTES:
+                    return {
+                        "success": False,
+                        "message": f"파일 크기({file_size / 1024 / 1024:.1f}MB)가 20MB 제한을 초과합니다.",
+                        "filename": meta.get("name"),
+                        "size": file_size,
+                    }
+                drive_id = meta.get("drive_id")
+                item_id = meta.get("item_id")
+                async with _httpx.AsyncClient(timeout=60) as client:
+                    dl_resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content",
+                        headers={"Authorization": f"Bearer {token}"},
+                        follow_redirects=True,
+                    )
+                if dl_resp.status_code != 200:
+                    return {"success": False, "message": f"참조 파일 다운로드 실패: HTTP {dl_resp.status_code}"}
+                content_bytes = dl_resp.content
+
+            else:
+                # fileAttachment — /$value 로 바이너리 취득
+                async with _httpx.AsyncClient(timeout=60) as client:
+                    dl_resp = await client.get(
+                        f"{base_url}/{attachment_id}/$value",
+                        headers=headers,
+                        follow_redirects=True,
+                    )
+                if dl_resp.status_code != 200:
+                    return {"success": False, "message": f"첨부파일 다운로드 실패: HTTP {dl_resp.status_code}"}
+                content_bytes = dl_resp.content
+                meta = {
+                    "name": att_data.get("name", ""),
+                    "size": att_data.get("size", len(content_bytes)),
+                    "mime_type": att_data.get("contentType", ""),
+                }
+
+            if not content_bytes:
+                return {"success": True, "attachment_id": attachment_id, "content": ""}
+
+            extracted = _extract_file_content(
+                content_bytes,
+                meta.get("mime_type", att_data.get("contentType", "")),
+                meta.get("name", att_data.get("name", "")),
+                max_chars,
+            )
+            return {
+                "success": True,
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "filename": meta.get("name", att_data.get("name")),
+                "size": meta.get("size", len(content_bytes)),
+                "file_type": extracted["file_type"],
+                "content": extracted["content"],
+                "truncated": extracted["truncated"],
+                "original_length": extracted["original_length"],
+            }
+
+        except Exception as e:
+            log.error("read_email_attachment 실패 (message_id=%s): %s", message_id, e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R14: 이메일 첨부파일 전체 내용 일괄 읽기
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def read_email_attachments_all(
+        message_id: Annotated[str, Field(min_length=1, description="이메일 ID (outlook_email_search 반환 'id' 값)")],
+        owner: Annotated[str, Field(description="이메일 소유자 이메일. 비우면 로그인 계정.")] = "",
+        max_chars_per_file: Annotated[int, Field(ge=500, le=50000, description="첨부파일당 최대 반환 문자 수 (기본 5000)")] = 5000,
+        include_inline: Annotated[bool, Field(description="본문 삽입용 인라인 첨부파일(서명 이미지 등)도 포함할지 여부")] = False,
+    ) -> dict:
+        """이메일 1건의 첨부파일 전체 내용을 한 번의 호출로 읽습니다.
+
+        read_email_attachment처럼 목록 조회 후 attachment_id로 한 개씩 다시 호출할 필요 없이,
+        message_id만으로 모든 fileAttachment/referenceAttachment의 내용을 읽어 반환합니다.
+        xlsx/docx/pptx/pdf는 텍스트로 추출합니다.
+        itemAttachment(메일/일정 첨부), 20MB 초과 파일, 다운로드 실패 항목은 'skipped'에 사유와 함께 표시됩니다.
+        Graph API 제약상 목록 단계에서는 첨부파일 유형을 구분하지 못해 itemAttachment/referenceAttachment도
+        일반 파일 다운로드를 먼저 시도하며, 실패 시 'skipped'에 HTTP 오류 사유로 표시됩니다.
+        Azure AD 앱에 Mail.ReadWrite Delegated 권한이 필요합니다.
+        """
+        import httpx as _httpx
+
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+        await fetch_user_profile()
+        resource_owner = owner or get_user_email()
+        token = get_access_token()
+        if not token:
+            return {"success": False, "message": "액세스 토큰을 가져올 수 없습니다. ms365_login으로 다시 로그인해주세요."}
+
+        base_url = f"https://graph.microsoft.com/v1.0/users/{resource_owner}/messages/{message_id}/attachments"
+        headers = {"Authorization": f"Bearer {token}"}
+        MAX_BYTES = 20 * 1024 * 1024
+
+        try:
+            async with _httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    base_url,
+                    params={"$select": "id,name,size,contentType,isInline"},
+                    headers=headers,
+                )
+            if resp.status_code != 200:
+                return {"success": False, "message": f"첨부파일 목록 조회 실패: HTTP {resp.status_code} — {resp.text[:300]}"}
+            items = resp.json().get("value", [])
+
+            results = []
+            skipped = []
+
+            for att in items:
+                att_id = att.get("id")
+                name = att.get("name", "")
+                odata_type = att.get("@odata.type", "")
+
+                if att.get("isInline", False) and not include_inline:
+                    skipped.append({"id": att_id, "name": name, "reason": "인라인 첨부파일 (include_inline=true로 포함 가능)"})
+                    continue
+                if "itemAttachment" in odata_type:
+                    skipped.append({"id": att_id, "name": name, "reason": "itemAttachment(메일/일정 첨부)는 지원하지 않음"})
+                    continue
+
+                try:
+                    if "referenceAttachment" in odata_type:
+                        source_url = att.get("sourceUrl", "")
+                        if not source_url:
+                            skipped.append({"id": att_id, "name": name, "reason": "sourceUrl 없음"})
+                            continue
+                        meta = await _resolve_file_meta(source_url, token)
+                        if "error" in meta:
+                            skipped.append({"id": att_id, "name": name, "reason": meta["error"]})
+                            continue
+                        file_size = meta.get("size") or 0
+                        if file_size > MAX_BYTES:
+                            skipped.append({"id": att_id, "name": name, "reason": f"크기 초과 ({file_size / 1024 / 1024:.1f}MB > 20MB)"})
+                            continue
+                        async with _httpx.AsyncClient(timeout=60) as client:
+                            dl_resp = await client.get(
+                                f"https://graph.microsoft.com/v1.0/drives/{meta.get('drive_id')}/items/{meta.get('item_id')}/content",
+                                headers=headers,
+                                follow_redirects=True,
+                            )
+                        if dl_resp.status_code != 200:
+                            skipped.append({"id": att_id, "name": name, "reason": f"참조 파일 다운로드 실패: HTTP {dl_resp.status_code}"})
+                            continue
+                        content_bytes = dl_resp.content
+                        mime_type = meta.get("mime_type", "")
+                        filename = meta.get("name") or name
+                        size = meta.get("size", len(content_bytes))
+                    else:
+                        size = att.get("size") or 0
+                        if size > MAX_BYTES:
+                            skipped.append({"id": att_id, "name": name, "reason": f"크기 초과 ({size / 1024 / 1024:.1f}MB > 20MB)"})
+                            continue
+                        async with _httpx.AsyncClient(timeout=60) as client:
+                            dl_resp = await client.get(
+                                f"{base_url}/{att_id}/$value",
+                                headers=headers,
+                                follow_redirects=True,
+                            )
+                        if dl_resp.status_code != 200:
+                            skipped.append({"id": att_id, "name": name, "reason": f"다운로드 실패: HTTP {dl_resp.status_code}"})
+                            continue
+                        content_bytes = dl_resp.content
+                        mime_type = att.get("contentType", "")
+                        filename = name
+                        size = att.get("size", len(content_bytes))
+
+                    if not content_bytes:
+                        results.append({
+                            "id": att_id, "name": filename, "size": size,
+                            "content_type": mime_type, "file_type": "empty", "content": "", "truncated": False,
+                        })
+                        continue
+
+                    extracted = _extract_file_content(content_bytes, mime_type, filename, max_chars_per_file)
+                    results.append({
+                        "id": att_id,
+                        "name": filename,
+                        "size": size,
+                        "content_type": mime_type,
+                        "file_type": extracted["file_type"],
+                        "content": extracted["content"],
+                        "truncated": extracted["truncated"],
+                        "original_length": extracted["original_length"],
+                    })
+                except Exception as e:
+                    skipped.append({"id": att_id, "name": name, "reason": str(e)})
+
+            log.info(
+                "read_email_attachments_all: message=%s owner=%s read=%d skipped=%d",
+                message_id, resource_owner, len(results), len(skipped),
+            )
+            return {
+                "success": True,
+                "message_id": message_id,
+                "owner": resource_owner,
+                "count": len(results),
+                "attachments": results,
+                "skipped": skipped,
+            }
+        except Exception as e:
+            log.error("read_email_attachments_all 실패 (message_id=%s): %s", message_id, e)
+            return {"success": False, "message": str(e)}
+
+    log.info(
+        "MS365 Graph API 읽기 도구 14개 등록 완료 "
+        "(채팅검색/회의가용/캘린더/이메일/리소스/SP파일/SP폴더/임직원조회/임직원상세/Teams채널조회/그룹채팅/채널메시지/이메일첨부/이메일첨부일괄)"
+    )
