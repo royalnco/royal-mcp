@@ -8,6 +8,8 @@
 #   Calendars.Read         — 캘린더/일정 읽기 + getSchedule
 #   Sites.Read.All         — SharePoint 사이트 검색
 #   Files.Read.All         — 파일 내용 읽기
+#   Reports.Read.All       — 사용량 보고서 조회 (org_usage_report)
+#                            로그인 계정이 Reports Reader 이상 관리자 역할이어야 함
 #
 # [chat_message_search]
 #   Delegated 인증 전환으로 향후 구현 가능.
@@ -16,12 +18,14 @@
 
 import os
 import logging
-from typing import Annotated, List
+from typing import Annotated, List, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field
 
 log = logging.getLogger("royal-mcp.ms365-read")
+
+_MAX_HOSTED_CONTENT_BYTES = 3 * 1024 * 1024  # Teams 인라인 이미지(hostedContent) base64 반환 한도
 
 
 def _extract_id_from_uri(uri: str) -> str:
@@ -201,6 +205,27 @@ async def _resolve_file_meta(uri: str, access_token: str) -> dict:
         "size": data.get("size") or 0,
         "mime_type": (data.get("file") or {}).get("mimeType", ""),
     }
+
+
+# ── Tool R17: 사용량 보고서(Reports API) 조회 지원 ───────────────
+
+_USAGE_REPORT_ENDPOINTS = {
+    "office365_active_users": "getOffice365ActiveUserDetail",   # 서비스별(Exchange/OneDrive/SharePoint/Teams) 최근 활동일
+    "mailbox_usage":          "getMailboxUsageDetail",           # 메일박스 용량·건수
+    "onedrive_usage":         "getOneDriveUsageAccountDetail",   # OneDrive 계정별 저장 용량
+    "sharepoint_usage":       "getSharePointSiteUsageDetail",    # SharePoint 사이트별 저장 용량
+    "teams_user_activity":    "getTeamsUserActivityUserDetail",  # 사용자별 Teams 채팅/통화/회의 활동
+    "teams_device_usage":     "getTeamsDeviceUsageUserDetail",   # 사용자별 Teams 접속 기기 유형
+    "email_activity":         "getEmailActivityUserDetail",      # 사용자별 이메일 송수신 활동
+}
+
+
+def _parse_usage_report_csv(text: str) -> list[dict]:
+    """Graph Reports API가 반환하는 CSV 본문을 dict 목록으로 파싱합니다."""
+    import csv
+    from io import StringIO
+    reader = csv.DictReader(StringIO(text))
+    return [dict(row) for row in reader]
 
 
 def register_ms365_read_tools(mcp):
@@ -1971,7 +1996,485 @@ def register_ms365_read_tools(mcp):
             log.error("read_email_attachments_all 실패 (message_id=%s): %s", message_id, e)
             return {"success": False, "message": str(e)}
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R15: Excel 워크시트 목록 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+    async def excel_list_worksheets(
+        drive_id: Annotated[str, Field(description="OneDrive/SharePoint 드라이브 ID")],
+        item_id: Annotated[str, Field(description="Excel 파일 item ID")],
+    ) -> dict:
+        """Excel 파일의 워크시트 목록을 조회합니다. excel_read_range/excel_write_range 호출 전 정확한 워크시트 이름을 확인할 때 사용하세요."""
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/workbook/worksheets",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            worksheets = [
+                {"id": ws.get("id"), "name": ws.get("name"), "position": ws.get("position")}
+                for ws in data.get("value", [])
+            ]
+            log.info("excel_list_worksheets: drive=%s item=%s count=%d", drive_id, item_id, len(worksheets))
+            return {"success": True, "worksheets": worksheets}
+        except httpx.HTTPStatusError as e:
+            log.error("excel_list_worksheets HTTP 오류: %s", e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("excel_list_worksheets 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R16: Excel 워크시트 범위 읽기
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+    async def excel_read_range(
+        drive_id: Annotated[str, Field(description="OneDrive/SharePoint 드라이브 ID")],
+        item_id: Annotated[str, Field(description="Excel 파일 item ID")],
+        worksheet: Annotated[str, Field(description="워크시트 이름 또는 ID (excel_list_worksheets로 확인)")],
+        address: Annotated[str, Field(description="읽을 범위 주소 (예: 'A1', 'A1:C10'). 비우면 사용 중인 전체 범위(usedRange)를 읽습니다.")] = "",
+    ) -> dict:
+        """Excel 워크시트의 범위 값을 조회합니다.
+        address를 지정하지 않으면 워크시트의 사용 중인 전체 범위(usedRange)를 반환합니다.
+        worksheet는 excel_list_worksheets 도구로 정확한 이름을 먼저 확인하세요.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+        from urllib.parse import quote
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        encoded_worksheet = quote(worksheet, safe="")
+        if address:
+            url = (
+                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}"
+                f"/workbook/worksheets/{encoded_worksheet}/range(address='{address}')"
+            )
+        else:
+            url = (
+                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}"
+                f"/workbook/worksheets/{encoded_worksheet}/usedRange"
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+                resp.raise_for_status()
+                data = resp.json()
+
+            log.info(
+                "excel_read_range: drive=%s item=%s worksheet=%s address=%s",
+                drive_id, item_id, worksheet, address or "(usedRange)",
+            )
+            return {
+                "success": True,
+                "worksheet": worksheet,
+                "address": data.get("address"),
+                "values": data.get("values"),
+                "row_count": data.get("rowCount"),
+                "column_count": data.get("columnCount"),
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("excel_read_range HTTP 오류: %s", e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("excel_read_range 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R17: 사용량 보고서 조회 (Reports API)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def org_usage_report(
+        report_type: Annotated[
+            Literal[
+                "office365_active_users", "mailbox_usage", "onedrive_usage",
+                "sharepoint_usage", "teams_user_activity", "teams_device_usage",
+                "email_activity",
+            ],
+            Field(description=(
+                "조회할 보고서 종류: "
+                "office365_active_users(서비스별 최근 활동일) · mailbox_usage(메일박스 용량) · "
+                "onedrive_usage(OneDrive 저장 용량) · sharepoint_usage(SharePoint 사이트 저장 용량) · "
+                "teams_user_activity(Teams 채팅/통화/회의 활동) · teams_device_usage(Teams 접속 기기 유형) · "
+                "email_activity(이메일 송수신 활동)"
+            )),
+        ],
+        period: Annotated[
+            Literal["D7", "D30", "D90", "D180"],
+            Field(description="집계 기간: D7/D30/D90/D180일 (기본 D30)"),
+        ] = "D30",
+        limit: Annotated[int, Field(ge=1, le=500, description="최대 반환 행 수 (기본 50, 사용자 단위 상세 보고서라 전 직원 수만큼 행이 나올 수 있음)")] = 50,
+    ) -> dict:
+        """조직의 Microsoft 365 사용량 보고서를 조회합니다 (사용자/사이트 단위 상세 보고서, CSV 원본을 파싱해 반환).
+
+        report_type으로 원하는 보고서를 선택하고, period로 집계 기간(D7/D30/D90/D180)을 지정하세요.
+        결과 컬럼명은 Graph API가 반환하는 원본 그대로입니다 (예: "User Principal Name", "Last Activity Date").
+
+        Azure AD 앱에 Reports.Read.All Delegated 권한이 필요합니다.
+        또한 로그인 계정이 Reports Reader 이상의 Azure AD 관리자 역할을 보유해야 합니다.
+        일반 직원 계정으로 호출하면 403 오류가 반환됩니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        endpoint = _USAGE_REPORT_ENDPOINTS[report_type]
+        url = f"https://graph.microsoft.com/v1.0/reports/{endpoint}(period='{period}')"
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, headers=headers, follow_redirects=True)
+            if resp.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'Reports.Read.All' Delegated 권한이 필요하거나, "
+                        "로그인 계정에 Reports Reader 이상의 관리자 역할이 없습니다. "
+                        "권한을 새로 추가했다면 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            resp.raise_for_status()
+
+            rows = _parse_usage_report_csv(resp.content.decode("utf-8-sig"))
+            total_rows = len(rows)
+            truncated = total_rows > limit
+            log.info(
+                "org_usage_report: type=%s period=%s rows=%d (by %s)",
+                report_type, period, total_rows, get_user_email(),
+            )
+            return {
+                "success": True,
+                "report_type": report_type,
+                "period": period,
+                "total_rows": total_rows,
+                "truncated": truncated,
+                "rows": rows[:limit],
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("org_usage_report HTTP 오류: %s — %s", e.response.status_code, e.response.text)
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("org_usage_report 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R18: Teams 채널 메시지 댓글(답글) 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channel_message_replies(
+        team_id: Annotated[str, Field(min_length=1, description="Teams 팀 ID (teams_channels_search 도구로 확인)")],
+        channel_id: Annotated[str, Field(min_length=1, description="Teams 채널 ID (teams_channels_search 도구로 확인)")],
+        message_id: Annotated[str, Field(min_length=1, description="댓글을 조회할 원본 채널 메시지 ID (chat_message_search 또는 teams_channel_messages 반환 'id' 값)")],
+        limit: Annotated[int, Field(ge=1, le=50, description="최대 반환 건수 (기본 50). Graph API 특성상 한 번에 최대 50건까지만 조회됩니다")] = 50,
+    ) -> dict:
+        """Teams 채널 메시지의 댓글(스레드 답글) 목록을 조회합니다.
+        message_id는 chat_message_search 또는 teams_channel_messages 도구로 먼저 확인하세요.
+        각 답글의 attachment_count로 첨부 여부를 먼저 확인한 뒤, 첨부파일 내용은
+        teams_channel_message_attachments, 본문에 붙여넣은 이미지는 teams_channel_message_images
+        도구에 이 도구가 반환한 답글 id를 reply_id로 넘겨 조회하세요.
+        시스템 이벤트(참가/퇴장 등)와 messageType이 'message'가 아닌 항목은 replies 목록에서 제외되며,
+        raw_count(Graph API가 반환한 전체 항목 수)와 count(실제 반환된 대화형 답글 수)가 다르면
+        제외된 항목이 있다는 뜻입니다(삭제된 답글도 messageType은 유지되므로 deletedDateTime으로 확인 가능).
+        Azure AD 앱에 ChannelMessage.Read.All Delegated 권한 및 관리자 동의가 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}/replies"
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, params={"$top": min(limit, 50)}, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            raw_items = data.get("value", [])
+            replies_out = []
+            for msg in raw_items:
+                if msg.get("messageType") != "message":
+                    continue
+                sender_info = msg.get("from") or {}
+                sender = (sender_info.get("user") or {}).get("displayName") or "알 수 없음"
+                body_content = (msg.get("body") or {}).get("content") or ""
+                replies_out.append({
+                    "id": msg.get("id"),
+                    "reply_to_id": msg.get("replyToId"),
+                    "sender": sender,
+                    "created_at": msg.get("createdDateTime"),
+                    "deleted_at": msg.get("deletedDateTime"),
+                    "body": body_content[:500],
+                    "reactions": [r.get("reactionType") for r in (msg.get("reactions") or [])],
+                    "attachment_count": len(msg.get("attachments") or []),
+                    "web_url": msg.get("webUrl"),
+                })
+                if len(replies_out) >= limit:
+                    break
+
+            replies_out.sort(key=lambda m: m["created_at"] or "")
+            log.info("teams_channel_message_replies: team=%s channel=%s message=%s count=%d",
+                     team_id, channel_id, message_id, len(replies_out))
+            return {
+                "success": True,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "raw_count": len(raw_items),
+                "count": len(replies_out),
+                "replies": replies_out,
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channel_message_replies HTTP 오류: %s", e.response.text)
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'ChannelMessage.Read.All' Delegated 권한과 "
+                        "관리자 동의가 필요합니다. Azure Portal에서 권한을 추가한 뒤 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            if e.response.status_code == 404:
+                return {"success": False, "status_code": 404, "message": f"메시지를 찾을 수 없습니다: {message_id}"}
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_channel_message_replies 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R19: Teams 채널 메시지 첨부파일 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channel_message_attachments(
+        team_id: Annotated[str, Field(min_length=1, description="Teams 팀 ID (teams_channels_search 도구로 확인)")],
+        channel_id: Annotated[str, Field(min_length=1, description="Teams 채널 ID (teams_channels_search 도구로 확인)")],
+        message_id: Annotated[str, Field(min_length=1, description="첨부파일을 조회할 메시지 ID (chat_message_search, teams_channel_messages, teams_channel_message_replies 반환 'id' 값)")],
+        reply_id: Annotated[str, Field(description="답글에 붙은 첨부파일을 조회할 경우 답글 메시지 ID. 원본 채널 메시지를 조회할 때는 비워둡니다.")] = "",
+    ) -> dict:
+        """Teams 채널 메시지(또는 답글)에 첨부된 파일·카드 목록을 조회합니다.
+        Teams에서 공유된 파일은 contentType='reference'로 표시되며, content_url에 SharePoint/OneDrive
+        공유 링크가 담겨 있습니다. 실제 파일 내용을 읽으려면 content_url을 sharepoint_search로 다시 검색해
+        drive_id/item_id를 확인하거나, read_resource 도구에 URL을 그대로 전달하세요.
+        contentType이 'reference'가 아닌 항목(공지·코드스니펫 등 카드류, application/vnd.microsoft.card.*)은
+        사용자가 말하는 "첨부파일"이 아닌 경우가 많아 file_count와 card_count를 구분해 반환합니다.
+        본문에 붙여넣은 인라인 이미지는 여기 나타나지 않습니다. 이미지는 teams_channel_message_images 도구를 사용하세요.
+        Azure AD 앱에 ChannelMessage.Read.All Delegated 권한 및 관리자 동의가 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        base = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}"
+        url = f"{base}/replies/{reply_id}" if reply_id else base
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            attachments_out = [
+                {
+                    "id": att.get("id"),
+                    "name": att.get("name"),
+                    "content_type": att.get("contentType"),
+                    "content_url": att.get("contentUrl"),
+                    "thumbnail_url": att.get("thumbnailUrl"),
+                }
+                for att in (data.get("attachments") or [])
+            ]
+            file_count = sum(1 for a in attachments_out if a["content_type"] == "reference")
+            card_count = len(attachments_out) - file_count
+
+            log.info("teams_channel_message_attachments: team=%s channel=%s message=%s reply=%s files=%d cards=%d",
+                     team_id, channel_id, message_id, reply_id or "-", file_count, card_count)
+            return {
+                "success": True,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "message_id": reply_id or message_id,
+                "count": len(attachments_out),
+                "file_count": file_count,
+                "card_count": card_count,
+                "attachments": attachments_out,
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channel_message_attachments HTTP 오류: %s", e.response.text)
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'ChannelMessage.Read.All' Delegated 권한과 "
+                        "관리자 동의가 필요합니다. Azure Portal에서 권한을 추가한 뒤 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            if e.response.status_code == 404:
+                return {"success": False, "status_code": 404, "message": f"메시지를 찾을 수 없습니다: {reply_id or message_id}"}
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_channel_message_attachments 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R20: Teams 채널 메시지 인라인 이미지 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channel_message_images(
+        team_id: Annotated[str, Field(min_length=1, description="Teams 팀 ID (teams_channels_search 도구로 확인)")],
+        channel_id: Annotated[str, Field(min_length=1, description="Teams 채널 ID (teams_channels_search 도구로 확인)")],
+        message_id: Annotated[str, Field(min_length=1, description="이미지를 조회할 메시지 ID (chat_message_search, teams_channel_messages, teams_channel_message_replies 반환 'id' 값)")],
+        reply_id: Annotated[str, Field(description="답글에 포함된 이미지를 조회할 경우 답글 메시지 ID. 원본 채널 메시지를 조회할 때는 비워둡니다.")] = "",
+        hosted_content_id: Annotated[str, Field(description="내용을 읽을 이미지 1개의 ID (목록 조회로 먼저 확인). 비우면 이미지 ID 목록만 반환합니다.")] = "",
+    ) -> dict:
+        """Teams 채널 메시지(또는 답글) 본문에 붙여넣은 인라인 이미지를 조회합니다.
+        - hosted_content_id 미지정: 메시지에 포함된 이미지(hostedContent) ID 목록만 반환합니다(내용 미포함).
+          Graph API 제약상 목록 조회 단계에서는 이미지 크기·형식을 알 수 없습니다.
+        - hosted_content_id 지정: 해당 이미지 1개의 실제 바이너리를 base64로 인코딩해 content_type과 함께 반환합니다.
+          이미지 크기가 3MB를 초과하면 내용을 반환하지 않고 오류를 안내합니다.
+        파일 형태로 공유된 첨부(카드/링크)는 여기 나타나지 않습니다. teams_channel_message_attachments 도구를 사용하세요.
+        Azure AD 앱에 ChannelMessage.Read.All Delegated 권한 및 관리자 동의가 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import base64
+        import httpx
+        from urllib.parse import quote
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        base = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}"
+        msg_base = f"{base}/replies/{reply_id}" if reply_id else base
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                if not hosted_content_id:
+                    resp = await client.get(f"{msg_base}/hostedContents", headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    images_out = [{"hosted_content_id": item.get("id")} for item in data.get("value", [])]
+
+                    log.info("teams_channel_message_images(목록): team=%s channel=%s message=%s reply=%s count=%d",
+                             team_id, channel_id, message_id, reply_id or "-", len(images_out))
+                    return {
+                        "success": True,
+                        "team_id": team_id,
+                        "channel_id": channel_id,
+                        "message_id": reply_id or message_id,
+                        "count": len(images_out),
+                        "images": images_out,
+                    }
+
+                content_url = f"{msg_base}/hostedContents/{quote(hosted_content_id, safe='')}/$value"
+                async with client.stream("GET", content_url, headers=headers) as stream_resp:
+                    if stream_resp.status_code >= 400:
+                        # 스트리밍 응답은 본문을 먼저 읽어둬야 아래 except에서 e.response.text 접근이 가능하다.
+                        await stream_resp.aread()
+                    stream_resp.raise_for_status()
+
+                    declared_length = stream_resp.headers.get("content-length")
+                    if declared_length and int(declared_length) > _MAX_HOSTED_CONTENT_BYTES:
+                        return {
+                            "success": False,
+                            "message": (
+                                f"이미지 크기({int(declared_length) / 1024 / 1024:.1f}MB)가 반환 한도(3MB)를 초과합니다. "
+                                "Teams 클라이언트에서 직접 확인하거나 web_url로 메시지를 열어보세요."
+                            ),
+                        }
+
+                    # content-length가 없거나(청크 전송) 부정확할 수 있으므로, 수신하면서도 한도를 재확인한다.
+                    chunks = bytearray()
+                    async for chunk in stream_resp.aiter_bytes():
+                        chunks.extend(chunk)
+                        if len(chunks) > _MAX_HOSTED_CONTENT_BYTES:
+                            return {
+                                "success": False,
+                                "message": (
+                                    "이미지 크기가 반환 한도(3MB)를 초과해 다운로드를 중단했습니다. "
+                                    "Teams 클라이언트에서 직접 확인하거나 web_url로 메시지를 열어보세요."
+                                ),
+                            }
+                    raw = bytes(chunks)
+                    content_type = stream_resp.headers.get("content-type", "application/octet-stream")
+
+            log.info("teams_channel_message_images(내용): team=%s channel=%s message=%s reply=%s hosted_content=%s size=%d",
+                     team_id, channel_id, message_id, reply_id or "-", hosted_content_id, len(raw))
+            return {
+                "success": True,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "message_id": reply_id or message_id,
+                "hosted_content_id": hosted_content_id,
+                "content_type": content_type,
+                "size": len(raw),
+                "content_base64": base64.b64encode(raw).decode("ascii"),
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channel_message_images HTTP 오류: %s", e.response.text[:300])
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'ChannelMessage.Read.All' Delegated 권한과 "
+                        "관리자 동의가 필요합니다. Azure Portal에서 권한을 추가한 뒤 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            if e.response.status_code == 404:
+                return {"success": False, "status_code": 404, "message": "메시지 또는 이미지를 찾을 수 없습니다."}
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_channel_message_images 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
     log.info(
-        "MS365 Graph API 읽기 도구 14개 등록 완료 "
-        "(채팅검색/회의가용/캘린더/이메일/리소스/SP파일/SP폴더/임직원조회/임직원상세/Teams채널조회/그룹채팅/채널메시지/이메일첨부/이메일첨부일괄)"
+        "MS365 Graph API 읽기 도구 20개 등록 완료 "
+        "(채팅검색/회의가용/캘린더/이메일/리소스/SP파일/SP폴더/임직원조회/임직원상세/Teams채널조회/그룹채팅/채널메시지/이메일첨부/이메일첨부일괄/"
+        "Excel워크시트목록/Excel범위읽기/사용량보고서/채널댓글조회/채널첨부파일조회/채널이미지조회)"
     )

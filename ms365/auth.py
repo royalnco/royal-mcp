@@ -36,10 +36,14 @@ MS365_SCOPES = [
     "Calendars.ReadWrite",
     "ChannelMessage.Send",
     # "ChannelMessage.Read.All" — 관리자 동의 필요, 로그인 오류 원인이 될 수 있어 제외
+    # "ChannelMessage.ReadWrite" — update_teams_channel_message/delete_teams_channel_message 도구에 필요.
+    #   관리자 동의 필요. Azure AD 앱에 권한 추가 + 관리자 동의를 먼저 완료한 뒤 이 줄의 주석을 해제할 것.
+    #   동의 전에 주석 해제하면 전체 사용자의 로그인(Device Code Flow)이 실패할 수 있음.
     "Chat.ReadWrite",           # Teams 그룹·1:1 채팅 발송/읽기
     "Team.ReadBasic.All",       # 가입 팀 목록 조회
     "Sites.ReadWrite.All",
     "Files.ReadWrite.All",
+    "Reports.Read.All",         # 사용량 보고서 조회 (org_usage_report). 로그인 계정이 Reports Reader 이상이어야 함
 ]
 
 # ── STDIO 모드 전역 상태 (단일 사용자) ──────────────────────

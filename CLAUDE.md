@@ -1,4 +1,4 @@
-# royal-ms365-mcp 프로젝트 가이드
+# royal-mcp 프로젝트 가이드
 
 로얄앤컴퍼니 사내 MCP 서버. MS365 Graph API(이메일·캘린더·Teams·SharePoint·OneDrive)를 Claude Code에서 사용할 수 있게 연결한다.
 
@@ -7,7 +7,7 @@
 ## 프로젝트 구조
 
 ```
-royal-ms365-mcp/
+royal-mcp/
 ├── server.py               # MCP 서버 진입점 (STDIO / HTTP 모드)
 ├── ms365/
 │   ├── __init__.py         # 공개 인터페이스 재수출
@@ -52,9 +52,9 @@ python server.py --http --port 8080 --host 0.0.0.0
 |------|------|------|
 | `TENANT_ID` | ✅ | Azure AD 테넌트 ID |
 | `CLIENT_ID` | ✅ | Azure AD 앱 등록 클라이언트 ID |
-| `MCP_SERVER_NAME` | 선택 | 서버 표시 이름 (기본: `royal-ms365-mcp`) |
+| `MCP_SERVER_NAME` | 선택 | 서버 표시 이름 (기본: `royal-mcp`) |
 | `MS365_AUTO_AUTH` | 선택 | 서버 시작 시 토큰 캐시 자동 복원 여부 (기본: `true`) |
-| `MS365_TOKEN_CACHE_PATH` | 선택 | 토큰 캐시 파일 경로 (기본: `~/.royal-ms365-mcp/token_cache.bin`) |
+| `MS365_TOKEN_CACHE_PATH` | 선택 | 토큰 캐시 파일 경로 (기본: `~/.royal-mcp/token_cache.bin`) |
 
 `.env.example`을 복사해 `.env`를 만든다. `.env`는 절대 커밋하지 않는다.
 
@@ -103,17 +103,19 @@ python server.py --http --port 8080 --host 0.0.0.0
 | `Mail.Send` | 이메일 발송·답장·전달 |
 | `Calendars.ReadWrite` | 캘린더 일정 조회·생성·수정·삭제 |
 | `ChannelMessage.Send` | Teams 채널 메시지 발송 |
+| `ChannelMessage.ReadWrite` | Teams 채널 메시지 수정·삭제 (`ChannelMessage.Send`와 별도로 관리자 동의 필요) |
 | `Chat.ReadWrite` | Teams 1:1·그룹 채팅 발송·읽기 |
 | `Team.ReadBasic.All` | 가입 팀 목록 조회 |
 | `Sites.ReadWrite.All` | SharePoint 파일 읽기·쓰기 |
 | `Files.ReadWrite.All` | OneDrive 파일 읽기·쓰기 |
 | `MailboxSettings.ReadWrite` | Outlook 범주(masterCategories) 관리 |
+| `Reports.Read.All` | 조직 사용량 보고서 조회 (로그인 계정이 Reports Reader 이상 관리자 역할 필요) |
 
 > **참고**: `ChannelMessage.Read.All`(채널 메시지 읽기)은 관리자 동의가 필요하므로 기본 스코프에서 제외됨. 채널 메시지 조회 도구 사용 시 별도 추가 필요.
 
 ---
 
-## 제공 도구 목록 (총 44개)
+## 제공 도구 목록 (총 59개)
 
 ### 서버 도구 (server.py) — 3개
 
@@ -123,21 +125,21 @@ python server.py --http --port 8080 --host 0.0.0.0
 | `ms365_logout` | MS365 로그아웃 (STDIO: 캐시 삭제, HTTP: Azure 포털 안내) |
 | `ms365_status` | 현재 로그인 상태 및 사용자 정보 확인 |
 
-### 쓰기 도구 (graph.py) — 26개
+### 쓰기 도구 (graph.py) — 35개
 
 | 번호 | 도구 | 설명 |
 |------|------|------|
-| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 |
+| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 (body_type='html' 지정 시 굵게·목록·줄바꿈 등 서식 적용) |
 | 2 | `create_sharepoint_file` | SharePoint 텍스트 파일 생성 |
-| 3 | `send_email` | Outlook 이메일 발송 |
+| 3 | `send_email` | Outlook 이메일 발송 (첨부파일 지원: 로컬 파일 3MB 이하 또는 OneDrive/SharePoint 파일의 사내 전용 공유 링크) |
 | 4 | `create_calendar_event` | 캘린더 일정 생성 (Teams 링크 포함 옵션) |
 | 5 | `send_teams_chat_message` | Teams 1:1 채팅 메시지 발송 |
 | 6 | `outlook_email_update_category` | 이메일 범주(Category) 설정 |
 | 7 | `update_calendar_event` | 캘린더 일정 수정 |
 | 8 | `delete_calendar_event` | 캘린더 일정 삭제 |
-| 9 | `outlook_email_reply` | 이메일 답장 (발신자만) |
-| 10 | `outlook_email_reply_all` | 이메일 전체 답장 |
-| 11 | `outlook_email_forward` | 이메일 전달 |
+| 9 | `outlook_email_reply` | 이메일 답장 (발신자만, 첨부파일 지원) |
+| 10 | `outlook_email_reply_all` | 이메일 전체 답장 (첨부파일 지원) |
+| 11 | `outlook_email_forward` | 이메일 전달 (첨부파일 추가 지원, 원본 첨부는 자동 유지) |
 | 12 | `outlook_email_move` | 이메일 폴더 이동 / 아카이브 |
 | 13 | `outlook_email_delete` | 이메일 삭제 (휴지통 이동) |
 | 14 | `outlook_email_mark_read` | 이메일 읽음/안읽음 처리 |
@@ -152,9 +154,18 @@ python server.py --http --port 8080 --host 0.0.0.0
 | 23 | `outlook_category_create` | Outlook 범주 생성 |
 | 24 | `outlook_category_update_color` | Outlook 범주 색상 변경 |
 | 25 | `outlook_category_delete` | Outlook 범주 삭제 |
-| 26 | `create_draft_email` | Outlook 임시보관함(Drafts)에 이메일 초안 작성·저장 (발송 안 함) |
+| 26 | `create_draft_email` | Outlook 임시보관함(Drafts)에 이메일 초안 작성·저장 (발송 안 함, 첨부파일 지원) |
+| 27 | `excel_write_range` | Excel 워크시트 범위에 값 쓰기 (세션 불필요, 즉시 파일에 반영·되돌리기 불가) |
+| 28 | `word_find_replace` | Word 문서(.docx) 본문·표 텍스트 찾기/바꾸기. 변경건수 반환, 0건이면 재업로드 생략 |
+| 29 | `pptx_find_replace` | PowerPoint(.pptx) 슬라이드·표·그룹도형 텍스트 찾기/바꾸기. 변경건수 반환, 0건이면 재업로드 생략 |
+| 30 | `excel_add_worksheet` | Excel 파일에 새 워크시트 추가 (이름 생략 시 자동 명명). 값 입력은 `excel_write_range`를 이어서 호출 |
+| 31 | `update_teams_channel_message` | Teams 채널 메시지 수정 (본문 전체 교체, 답글 수정 지원, 본인이 보낸 메시지만 가능) |
+| 32 | `delete_teams_channel_message` | Teams 채널 메시지 삭제 (Soft Delete, 답글 삭제 지원, 본인이 보낸 메시지만 가능) |
+| 33 | `onedrive_grant_permission` | OneDrive/SharePoint 파일·폴더에 특정 사내 사용자의 read/write 권한 부여 (invite) |
+| 34 | `onedrive_list_permissions` | 파일·폴더에 설정된 권한 목록 조회 (permission_id 확인, 상속·공유링크 여부 포함) |
+| 35 | `onedrive_revoke_permission` | 특정 사용자의 권한 회수 (상속된 권한·다인 공유링크는 회수 거부하고 사유 안내) |
 
-### 읽기 도구 (graph_read.py) — 14개
+### 읽기 도구 (graph_read.py) — 20개
 
 | 번호 | 도구 | 설명 |
 |------|------|------|
@@ -172,6 +183,12 @@ python server.py --http --port 8080 --host 0.0.0.0
 | R12 | `teams_channel_messages` | Teams 팀 채널 메시지 날짜 조회 |
 | R13 | `read_email_attachment` | 이메일 첨부파일 목록 조회 및 내용 읽기 |
 | R14 | `read_email_attachments_all` | 이메일 1건의 첨부파일 전체 내용을 한 번의 호출로 일괄 읽기 |
+| R15 | `excel_list_worksheets` | Excel 파일의 워크시트 목록 조회 (이름/ID/위치) |
+| R16 | `excel_read_range` | Excel 워크시트 범위 값 조회. address 생략 시 사용 중인 전체 범위(usedRange) 반환 |
+| R17 | `org_usage_report` | 조직 사용량 보고서 조회 (Office365 활성사용자/메일박스/OneDrive/SharePoint/Teams활동/Teams기기/이메일활동). Reports Reader 이상 관리자 계정 필요 |
+| R18 | `teams_channel_message_replies` | Teams 채널 메시지의 댓글(스레드 답글) 목록 조회 |
+| R19 | `teams_channel_message_attachments` | Teams 채널 메시지(또는 답글)의 첨부파일·카드 목록 조회 (파일 내용은 content_url을 sharepoint_search/read_resource로 재조회) |
+| R20 | `teams_channel_message_images` | Teams 채널 메시지(또는 답글) 본문의 인라인 이미지 조회 (목록만/개별 이미지 base64, 3MB 초과 시 반환 안 함) |
 
 ### 기간계 DB ERP 도구 (erp/insa.py) — 1개
 
@@ -180,6 +197,19 @@ python server.py --http --port 8080 --host 0.0.0.0
 | E1 | `get_insa_calendar` | 특정 날짜의 인사 캘린더(근무일/휴일/요일) 조회. **MS365 로그인 필요** |
 
 > `get_insa_calendar` 응답 필드: `TP_WEEK` (1=일~7=토), `FG1_HOLIDAY` (W=평일, H=공휴일)
+
+---
+
+## 이메일 첨부파일 (graph.py — EmailAttachment)
+
+`send_email`, `create_draft_email`, `outlook_email_reply`, `outlook_email_reply_all`, `outlook_email_forward` 5개 도구가 공통으로 `attachments` 파라미터를 지원한다. 각 항목은 아래 둘 중 하나를 지정한다.
+
+| 지정 방식 | 동작 | 제약 |
+|-----------|------|------|
+| `local_path` | 파일을 읽어 base64로 인코딩해 이메일에 직접 첨부(fileAttachment) | 파일당 3MB 이하, 로컬 첨부 합계도 3MB 이하. **STDIO 모드에서만 허용**(사용자 본인 PC 경로 기준). **HTTP 모드(사내 공용 서버)에서는 서버 파일시스템 임의 접근 위험 때문에 거부됨** |
+| `drive_id` + `item_id` | 파일 내용을 내려받지 않고, 사내 전용(`organizationView`) 공유 링크를 생성해 링크 첨부(referenceAttachment) | drive_id/item_id는 `sharepoint_search`로 확인. 수신자가 사내 계정으로 로그인해야 열람 가능. 파일 크기 제약 없음(HTTP 모드에서도 사용 가능) |
+
+3MB(또는 로컬 첨부 합계 3MB)를 초과하는 파일은 `onedrive_upload_file`로 먼저 업로드한 뒤 `drive_id`+`item_id`로 첨부하도록 안내한다. `outlook_email_reply`/`reply_all`/`forward`는 첨부파일이 있으면 `body_type` 설정과 무관하게 내부적으로 초안(Draft) 경유 방식으로 전환되며, 첨부 처리 중 오류가 발생하면 초안을 정리(삭제)하고 발송하지 않는다.
 
 ---
 
@@ -196,6 +226,24 @@ OneDrive/SharePoint 파일을 다운로드 후 메모리 내에서 텍스트 추
 
 ---
 
+## Office 문서 편집 도구 (Excel/Word/PowerPoint)
+
+| 파일 유형 | 방식 | 도구 |
+|-----------|------|------|
+| Excel | Graph Workbook API로 셀/범위 직접 read·write (세션 불필요, 산발적 호출 기준) | `excel_list_worksheets`, `excel_read_range`, `excel_write_range`, `excel_add_worksheet` |
+| Word/PowerPoint | Graph에 콘텐츠 편집 API가 없어 다운로드→python-docx/pptx로 치환→재업로드(덮어쓰기) 방식 | `word_find_replace`, `pptx_find_replace` |
+
+**알려진 한계 (설계상 수용, 사용자 승인됨)**
+- 텍스트가 여러 run(서식 조각)에 걸쳐 나뉘어 있으면 매칭되지 않아 `replaced_count: 0`을 반환합니다. 이는 오류가 아니라 python-docx/pptx의 구조적 한계이며, 재업로드 자체를 생략하므로 파일은 변경되지 않습니다.
+- 저장 시 문서 전체를 재작성하므로 주석, 추적 변경, 일부 고급 서식이 유실될 수 있습니다. 문제가 있으면 `onedrive_list_versions`로 이전 버전을 확인해 복구하세요.
+- Word는 본문 단락과 표만 탐색합니다 (머리글/바닥글, 텍스트 상자, 중첩 표 제외). PowerPoint는 그룹 도형 내부까지 재귀 탐색합니다.
+
+**동시편집 보호**: `word_find_replace`/`pptx_find_replace`는 다운로드 시점의 eTag를 기억해 재업로드 시 `If-Match` 헤더로 검증합니다. 그 사이 다른 사용자가 파일을 수정했으면 덮어쓰지 않고 명확한 오류를 반환합니다. `excel_write_range`는 range 단위로만 PATCH하므로 이 문제 자체가 없습니다.
+
+**실사용 확인된 제약 (2026-07-08)**: 셀 데이터가 전혀 없는 완전히 빈 xlsx(예: `openpyxl.Workbook()` 직후 바로 저장한 파일)를 OneDrive에 올리면 Graph Workbook API가 `FileCorruptTryRepair`/`unsupportedWorkbook` 오류로 거부합니다. 새 Excel 파일을 만들 때는 로컬에서 최소 1개 셀 이상 값을 채운 뒤 업로드하세요(완전한 빈 시트를 만들고 `excel_write_range`로 채우는 순서는 실패함).
+
+---
+
 ## 배포 주의사항
 
 ### ZIP 배포 시 반드시 제외
@@ -205,7 +253,7 @@ OneDrive/SharePoint 파일을 다운로드 후 메모리 내에서 텍스트 추
 
 ### 직원 PC 설치 경로 제한
 - 경로에 **한글, 공백 불가** (Python venv 경로 파싱 오류)
-- 권장: `C:\royal-ms365-mcp\`, `D:\tools\royal-ms365-mcp\`
+- 권장: `C:\royal-mcp\`, `D:\tools\royal-mcp\`
 
 ### `.env` 파일 생성 (Windows)
 메모장으로 생성 시 저장 형식을 **"모든 파일(\*.\*)"** 으로 변경해야 `.env.txt`로 저장되는 것을 방지할 수 있다.
@@ -228,5 +276,7 @@ OneDrive/SharePoint 파일을 다운로드 후 메모리 내에서 텍스트 추
 | `.env` 인식 안 됨 | `.env.txt`로 저장됨 | 파일 형식 확인, 확장자 제거 |
 | `Activate.ps1` 실행 오류 | PowerShell 실행 정책 제한 | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | 로그인 후 권한 오류 | Azure AD 동의 미완료 | 관리자에게 Azure AD 권한 동의 요청 |
-| `teams_channel_messages` 403 오류 | `ChannelMessage.Read.All` 관리자 동의 미완료 | Azure Portal에서 `ChannelMessage.Read.All` 권한 추가 후 재로그인 |
+| `teams_channel_messages`/`teams_channel_message_replies`/`teams_channel_message_attachments`/`teams_channel_message_images` 403 오류 | `ChannelMessage.Read.All` 관리자 동의 미완료 | Azure Portal에서 `ChannelMessage.Read.All` 권한 추가 후 재로그인 |
+| `update_teams_channel_message`/`delete_teams_channel_message` 403 오류 | `ChannelMessage.ReadWrite` 미동의, 또는 본인이 보낸 메시지가 아님 | Azure Portal에서 `ChannelMessage.ReadWrite` 권한 추가 후 재로그인. 타인이 보낸 메시지는 Graph API 정책상 수정·삭제 불가 |
 | 임직원 조회 결과 없음 | `User.Read.All` 관리자 동의 미완료 | Azure Portal에서 `User.Read.All` 권한 추가 |
+| `org_usage_report` 403 오류 | 로그인 계정에 Reports Reader 이상 관리자 역할 없음, 또는 권한 추가 후 재로그인 안 함 | Azure AD에서 계정에 Reports Reader 역할 부여 + `ms365_logout` → `ms365_login` 재인증 |

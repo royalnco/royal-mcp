@@ -1,4 +1,4 @@
-# royal-ms365-mcp
+# royal-mcp
 
 로얄앤컴퍼니 사내 MCP 서버.  
 MS365 Graph API(이메일·캘린더·Teams·SharePoint·OneDrive)를 Claude Code에서 직접 사용할 수 있게 연결합니다.
@@ -36,28 +36,37 @@ Python이 없으면 [python.org](https://python.org)에서 설치 (설치 시 **
 경로에 **한글·공백 불가** (Python 가상환경 경로 파싱 오류)
 
 ```
-✅ C:\royal-ms365-mcp\
-✅ D:\tools\royal-ms365-mcp\
-✅ C:\Users\kjr\royal-ms365-mcp\
-❌ C:\내 문서\royal-ms365-mcp\      ← 한글 포함 불가
-❌ D:\My Documents\royal-ms365-mcp\ ← 공백 포함 불가
+✅ C:\royal-mcp\
+✅ D:\tools\royal-mcp\
+✅ C:\Users\kjr\royal-mcp\
+❌ C:\내 문서\royal-mcp\      ← 한글 포함 불가
+❌ D:\My Documents\royal-mcp\ ← 공백 포함 불가
 ```
 
 ---
 
 ## 3. 프로젝트 파일 내려받기
 
-관리자(정보관리팀)로부터 받은 **`royal-ms365-mcp.zip`** 파일을 설치할 위치에 압축 해제합니다.
+GitHub(royalnco 조직)의 **`royal-mcp`** 저장소를 Git Clone으로 설치할 위치에 내려받습니다.
 
-### 압축 해제 방법
+> Git이 설치되어 있지 않다면 [git-scm.com/download/win](https://git-scm.com/download/win)에서 먼저 설치하세요. (`git --version`으로 설치 여부 확인 가능)
 
-**방법 — 탐색기**
+### Git Clone 방법
 
-1. `royal-ms365-mcp.zip` 파일을 설치할 위치로 복사합니다.
-2. 파일을 마우스 오른쪽 버튼으로 클릭 → **"모두 압축 풀기"** 선택
-3. 압축 풀기 경로를 확인합니다.  
-   예: `C:\` 에서 압축을 풀면 → `C:\royal-ms365-mcp\` 폴더가 생성됩니다.
-4. **"압축 풀기"** 버튼을 클릭합니다.
+**방법 — PowerShell**
+
+1. 설치할 위치로 이동합니다.
+   ```powershell
+   cd C:\
+   ```
+2. 저장소를 복제합니다.
+   ```powershell
+   git clone https://github.com/royalnco/royal-mcp.git
+   ```
+3. 복제가 완료되면 해당 위치에 `royal-mcp` 폴더가 생성됩니다.  
+   예: `C:\` 에서 복제하면 → `C:\royal-mcp\` 폴더가 생성됩니다.
+
+> 접근 권한 오류가 발생하면 GitHub 조직(royalnco) 저장소 접근 권한이 부여되어 있는지 정보관리팀에 확인하세요.
 
 ---
 
@@ -71,7 +80,7 @@ Python이 없으면 [python.org](https://python.org)에서 설치 (설치 시 **
 > 시작 메뉴에서 **"Windows PowerShell"** 을 검색해 열거나, **Win + X** 단축키를 누른 후 **터미널(또는 Windows PowerShell)**을 실행하세요.
 
 ```powershell
-cd {설치경로(royal-ms365-mcp)}
+cd {설치경로(royal-mcp)}
 .\setup.ps1
 ```
 
@@ -80,7 +89,7 @@ cd {설치경로(royal-ms365-mcp)}
 **Mac / Linux — 터미널**
 
 ```bash
-cd {설치경로(royal-ms365-mcp)}
+cd {설치경로(royal-mcp)}
 bash setup.sh
 ```
 
@@ -97,9 +106,9 @@ bash setup.sh
 값은 **관리자(정보관리팀)에게 문의**하여 받습니다.
 
 ```powershell
-claude mcp add --scope user royal-ms365-mcp `
+claude mcp add --scope user royal-mcp `
   "{설치경로}\.venv\Scripts\python.exe" "{설치경로}\server.py" `
-  --env "MCP_SERVER_NAME=royal-ms365-mcp" `
+  --env "MCP_SERVER_NAME=royal-mcp" `
   --env "TENANT_ID=테넌트ID" `
   --env "CLIENT_ID=클라이언트ID" `
   --env "MS365_AUTO_AUTH=false"
@@ -147,7 +156,7 @@ MS365 로그인 완료 후 인증 토큰은 **로컬 파일(`token_cache.bin`)�
 
 | 항목 | 내용 |
 |------|------|
-| 캐시 파일 위치 | `~/.royal-ms365-mcp/token_cache.bin` (사용자 홈 디렉터리) |
+| 캐시 파일 위치 | `~/.royal-mcp/token_cache.bin` (사용자 홈 디렉터리) |
 | `.gitignore` 확인 | `token_cache*` 패턴이 `.gitignore`에 포함되어 있는지 반드시 확인 |
 | PC 공유·양도 시 | `ms365 로그아웃해줘` 실행 후 인계 (캐시 파일 자동 삭제됨) |
 | 토큰 만료·초기화 | `ms365 로그아웃해줘` 후 `ms365 로그인해줘`로 재인증 |
@@ -175,7 +184,7 @@ MS365 로그인 완료 후 인증 토큰은 **로컬 파일(`token_cache.bin`)�
 
 ## 9. 프롬프트 모음
 
-> 로얄앤컴퍼니 MS365 MCP 전체 기능(40종) 활용 예시  
+> 로얄앤컴퍼니 MS365 MCP 전체 기능(50종) 활용 예시  
 > Claude 채팅창에 그대로 입력하거나 업무 상황에 맞게 수정하여 사용하세요.
 
 ### 목차
@@ -191,7 +200,8 @@ MS365 로그인 완료 후 인증 토큰은 **로컬 파일(`token_cache.bin`)�
 9. [Teams — 채널·대화 조회](#teams--채널대화-조회)
 10. [SharePoint·OneDrive — 파일 검색·읽기](#sharepointonedrive--파일-검색읽기)
 11. [SharePoint·OneDrive — 파일 관리](#sharepointonedrive--파일-관리)
-12. [복합 프롬프트 — 업무 흐름 한 번에](#복합-프롬프트--업무-흐름-한-번에)
+12. [Excel·Word·PowerPoint — 내용 편집](#excelwordpowerpoint--내용-편집)
+13. [복합 프롬프트 — 업무 흐름 한 번에](#복합-프롬프트--업무-흐름-한-번에)
 
 ---
 
@@ -835,6 +845,57 @@ SharePoint에 있는 RB-7000 사양서 버전 이력 보여줘.
 ```
 OO인테리어 발주서 버전 목록 확인해줘.
 혹시 내용이 바뀐 게 있는지 보려고.
+```
+
+---
+
+### Excel·Word·PowerPoint — 내용 편집
+
+SharePoint·OneDrive에 저장된 Excel·Word·PowerPoint 파일의 내용을 직접 수정합니다.
+Excel은 셀 단위로 즉시 반영되고, Word·PowerPoint는 찾은 텍스트 개수를 알려주며 텍스트를 찾지 못하면 파일을 건드리지 않습니다.
+
+> ⚠️ Word·PowerPoint 편집은 문서를 통째로 다시 저장하는 방식이라 주석·추적변경 등 일부 서식이 유지되지 않을 수 있습니다. 문제가 있으면 "파일 버전 이력 조회"로 이전 버전을 확인해 복구할 수 있습니다.
+
+#### Excel 시트 추가/범위 읽기/쓰기
+
+```
+수주현황.xlsx 파일에 "7월" 이름으로 새 시트 추가해줘.
+```
+
+```
+SharePoint 수주현황.xlsx 파일에서 워크시트 목록 보여줘.
+```
+
+```
+수주현황.xlsx의 "6월" 시트 A1:D10 범위 값 읽어줘.
+```
+
+```
+수주현황.xlsx의 "6월" 시트 B5 셀에 "OO인테리어"라고 써줘.
+```
+
+```
+사양서.xlsx "재고" 시트 A2:B2에 ["RB-7000", 500] 값 입력해줘.
+```
+
+#### Word 텍스트 찾기/바꾸기
+
+```
+SharePoint에 있는 발주서_초안.docx에서 "OO건설"을 "OO인테리어"로 바꿔줘.
+```
+
+```
+RB-7000_사양서.docx 문서에서 "구버전"이라는 단어를 전부 "신버전"으로 바꿔줘. 몇 건 바뀌었는지도 알려줘.
+```
+
+#### PowerPoint 텍스트 찾기/바꾸기
+
+```
+RB-7000_카탈로그.pptx에서 "출시예정"을 "출시완료"로 전부 바꿔줘.
+```
+
+```
+신제품_소개.pptx 슬라이드에서 "2026년 상반기"를 "2026년 하반기"로 바꿔줘.
 ```
 
 ---
