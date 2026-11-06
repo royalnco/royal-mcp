@@ -39,3 +39,21 @@ build/
 # PDF 배포 파일
 *.pdf
 test_pdf.md
+
+# 비밀 정보·인증서 (회사 기본 제외 대상)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+credentials.json
+serviceAccount*.json
+
+# 로그·임시 파일
+*.log
+logs/
+*.tmp
+*.temp
+*.bak

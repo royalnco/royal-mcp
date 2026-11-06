@@ -75,6 +75,58 @@ def _to_kst_date(utc_str: str) -> str:
         return ""
 
 
+def _parse_graph_dt(utc_str: str):
+    """Graph API datetime 문자열을 timezone-aware datetime으로 변환합니다. 실패 시 None 반환."""
+    if not utc_str:
+        return None
+    try:
+        from datetime import datetime, timezone
+        s = utc_str.replace("Z", "+00:00").replace("z", "+00:00")
+        if "." in s:
+            head, tail = s.split(".", 1)
+            digits, i = "", 0
+            while i < len(tail) and tail[i].isdigit():
+                digits += tail[i]; i += 1
+            s = f"{head}.{digits[:6]}{tail[i:]}"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _to_kst_str(utc_str: str) -> str:
+    """Graph API datetime 문자열을 KST 'YYYY-MM-DD HH:MM'으로 변환합니다. 실패 시 원문 반환."""
+    dt = _parse_graph_dt(utc_str)
+    if not dt:
+        return utc_str or ""
+    from datetime import timezone, timedelta
+    return dt.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
+
+
+def _html_to_text(html: str) -> str:
+    """Teams 메시지 HTML 본문을 읽기 쉬운 평문으로 변환합니다."""
+    import re
+    import html as _html
+    if not html:
+        return ""
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", html)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = _html.unescape(s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _message_sender(msg: dict) -> tuple[str, str]:
+    """chatMessage의 (발신자 이름, 발신자 사용자 ID)를 반환합니다."""
+    sender_info = msg.get("from") or {}
+    user = sender_info.get("user") or {}
+    app = sender_info.get("application") or {}
+    name = user.get("displayName") or app.get("displayName") or "알 수 없음"
+    return name, user.get("id") or ""
+
+
 def _encode_sharing_url(url: str) -> str:
     """SharePoint/OneDrive URL을 Graph Shares API 토큰으로 인코딩합니다."""
     import base64
@@ -249,6 +301,10 @@ def register_ms365_read_tools(mcp):
         """Teams 채널 및 채팅 메시지를 키워드로 검색합니다.
         - team_id + channel_id 지정: 해당 채널 메시지에서 키워드 필터링 (ChannelMessage.Read.All 필요)
         - 미지정: Graph Search API로 접근 가능한 전체 chatMessage 검색 (Chat.ReadWrite 필요)
+        본문(body)은 잘라내지 않고 Graph API가 반환한 원문(HTML) 전체를 반환합니다.
+        단, 전체 검색(Search API) 결과의 본문은 검색 엔진이 제공하는 값이라 원문 일부일 수 있으므로,
+        원문 전체가 필요하면 반환된 team_id/channel_id로 teams_channel_messages 또는
+        teams_channel_message_replies를 다시 조회하세요.
         ms365_login으로 로그인 후 사용하세요.
         """
         auth_err = require_auth()
@@ -288,7 +344,7 @@ def register_ms365_read_tools(mcp):
                         "id": msg.get("id"),
                         "sender": (sender.get("user") or {}).get("displayName"),
                         "created_at": msg.get("createdDateTime"),
-                        "body": body[:500],
+                        "body": body,
                         "message_type": msg.get("messageType"),
                         "web_url": msg.get("webUrl"),
                     })
@@ -338,7 +394,7 @@ def register_ms365_read_tools(mcp):
                             "id": res.get("id"),
                             "sender": (res.get("from") or {}).get("user", {}).get("displayName"),
                             "created_at": res.get("createdDateTime"),
-                            "body": (res.get("body") or {}).get("content", "")[:500],
+                            "body": (res.get("body") or {}).get("content", ""),
                             "channel_id": res.get("channelIdentity", {}).get("channelId"),
                             "team_id": res.get("channelIdentity", {}).get("teamId"),
                             "web_url": res.get("webUrl"),
@@ -1555,7 +1611,7 @@ def register_ms365_read_tools(mcp):
                             "id": msg.get("id"),
                             "sender": sender,
                             "created_at": created_at,
-                            "body": body_content[:500],
+                            "body": body_content,
                             "attachments": len(msg.get("attachments") or []),
                         })
                         if len(messages_out) >= limit:
@@ -1655,7 +1711,7 @@ def register_ms365_read_tools(mcp):
                             "id": msg.get("id"),
                             "sender": sender,
                             "created_at": created_at,
-                            "body": body_content[:500],
+                            "body": body_content,
                             "reactions": [r.get("reactionType") for r in (msg.get("reactions") or [])],
                             "web_url": msg.get("webUrl"),
                         })
@@ -2237,7 +2293,7 @@ def register_ms365_read_tools(mcp):
                     "sender": sender,
                     "created_at": msg.get("createdDateTime"),
                     "deleted_at": msg.get("deletedDateTime"),
-                    "body": body_content[:500],
+                    "body": body_content,
                     "reactions": [r.get("reactionType") for r in (msg.get("reactions") or [])],
                     "attachment_count": len(msg.get("attachments") or []),
                     "web_url": msg.get("webUrl"),
@@ -2473,8 +2529,432 @@ def register_ms365_read_tools(mcp):
             log.error("teams_channel_message_images 실패: %s", e)
             return {"success": False, "message": str(e)}
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R21: Teams 읽지 않은 채팅 조회
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 판별 기준: /me/chats 응답의 viewpoint.lastMessageReadDateTime(내가 마지막으로 읽은 시각)보다
+    # lastMessagePreview.createdDateTime(마지막 메시지 시각)이 늦고, 마지막 메시지 발신자가 본인이 아니면 미확인.
+    # viewpoint는 채팅 목록 조회(List chats)에서만 제공된다.
+    _MAX_CHAT_PAGES = 4  # /me/chats 최대 4페이지(약 200개 채팅)까지만 확인
+
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_unread_chats(
+        chat_type: Annotated[
+            Literal["all", "oneOnOne", "group", "meeting"],
+            Field(description="채팅 유형 필터. all(기본)=전체, oneOnOne=1:1, group=그룹, meeting=회의 채팅"),
+        ] = "all",
+        include_messages: Annotated[bool, Field(
+            description="true(기본)면 채팅별 읽지 않은 메시지 본문까지 반환, false면 채팅 목록과 마지막 메시지 미리보기만 반환",
+        )] = True,
+        max_chats: Annotated[int, Field(ge=1, le=50, description="반환할 최대 미확인 채팅 수 (기본 20)")] = 20,
+        max_messages_per_chat: Annotated[int, Field(ge=1, le=50, description="채팅당 최대 반환 메시지 수 (기본 20)")] = 20,
+    ) -> dict:
+        """Teams 채팅(1:1·그룹·회의 채팅) 중 읽지 않은 메시지가 있는 채팅과 그 메시지를 조회합니다.
+        Teams 클라이언트의 읽음 상태(내가 마지막으로 읽은 시각)를 기준으로 판별하며, 본인이 보낸 메시지는 제외합니다.
+        이 도구는 읽음 처리를 하지 않습니다(조회만 수행).
+        팀 채널 메시지는 Graph API가 읽음 상태를 제공하지 않으므로 teams_channel_new_messages 도구를 사용하세요.
+        Azure AD 앱에 Chat.ReadWrite(또는 Chat.Read) Delegated 권한이 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        warnings: list[str] = []
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                me_resp = await client.get(
+                    "https://graph.microsoft.com/v1.0/me", params={"$select": "id"}, headers=headers,
+                )
+                me_resp.raise_for_status()
+                my_id = me_resp.json().get("id") or ""
+
+                # 1. 채팅 목록 + 마지막 메시지 미리보기 + 읽음 상태(viewpoint)
+                chats: list[dict] = []
+                next_url = "https://graph.microsoft.com/v1.0/me/chats"
+                next_params: dict | None = {
+                    "$expand": "lastMessagePreview",
+                    "$orderby": "lastMessagePreview/createdDateTime desc",
+                    "$top": 50,
+                }
+                pages = 0
+                while next_url and pages < _MAX_CHAT_PAGES:
+                    resp = await client.get(next_url, params=next_params, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    chats.extend(data.get("value", []))
+                    next_params = None
+                    next_url = data.get("@odata.nextLink", "")
+                    pages += 1
+                if next_url:
+                    warnings.append(f"채팅이 많아 최근 활동 순 상위 {len(chats)}개 채팅만 확인했습니다.")
+
+                # 2. 미확인 채팅 판별
+                unread_chats: list[dict] = []
+                no_viewpoint = 0
+                for c in chats:
+                    if chat_type != "all" and c.get("chatType") != chat_type:
+                        continue
+                    viewpoint = c.get("viewpoint")
+                    if viewpoint is None:
+                        no_viewpoint += 1
+                        continue
+                    if viewpoint.get("isHidden"):
+                        continue
+                    preview = c.get("lastMessagePreview") or {}
+                    if not preview or preview.get("isDeleted"):
+                        continue
+                    _, preview_sender_id = _message_sender(preview)
+                    if my_id and preview_sender_id == my_id:
+                        continue  # 마지막 메시지를 본인이 보냄 → 미확인 없음
+                    last_msg_at = _parse_graph_dt(preview.get("createdDateTime") or "")
+                    last_read_at = _parse_graph_dt(viewpoint.get("lastMessageReadDateTime") or "")
+                    if not last_msg_at:
+                        continue
+                    if last_read_at and last_msg_at <= last_read_at:
+                        continue
+                    unread_chats.append({"chat": c, "last_read_at": last_read_at})
+
+                if no_viewpoint:
+                    warnings.append(
+                        f"{no_viewpoint}개 채팅은 Graph API가 읽음 상태(viewpoint)를 반환하지 않아 판별에서 제외했습니다."
+                    )
+
+                total_unread_chats = len(unread_chats)
+                unread_chats = unread_chats[:max_chats]
+
+                # 3. 채팅별 이름(멤버)과 미확인 메시지 조회
+                chats_out = []
+                for item in unread_chats:
+                    c = item["chat"]
+                    last_read_at = item["last_read_at"]
+                    chat_id = c.get("id")
+                    preview = c.get("lastMessagePreview") or {}
+                    preview_sender, _ = _message_sender(preview)
+
+                    members: list[str] = []
+                    if not c.get("topic"):
+                        try:
+                            m_resp = await client.get(
+                                f"https://graph.microsoft.com/v1.0/chats/{chat_id}/members",
+                                headers=headers,
+                            )
+                            if m_resp.status_code == 200:
+                                members = [
+                                    m.get("displayName") or m.get("email") or ""
+                                    for m in m_resp.json().get("value", [])
+                                    if m.get("userId") != my_id
+                                ]
+                        except Exception as e:
+                            log.debug("채팅 멤버 조회 실패(%s): %s", chat_id, e)
+
+                    chat_out = {
+                        "chat_id": chat_id,
+                        "chat_type": c.get("chatType"),
+                        "title": c.get("topic") or ", ".join(m for m in members if m) or "(제목 없음)",
+                        "last_read_at": _to_kst_str(last_read_at.isoformat()) if last_read_at else None,
+                        "last_message": {
+                            "sender": preview_sender,
+                            "created_at": _to_kst_str(preview.get("createdDateTime") or ""),
+                            "preview": _html_to_text((preview.get("body") or {}).get("content") or "")[:200],
+                        },
+                        "web_url": c.get("webUrl"),
+                    }
+
+                    if include_messages:
+                        messages: list[dict] = []
+                        truncated = False
+                        try:
+                            msg_url = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages"
+                            msg_params: dict | None = {"$top": 50, "$orderby": "createdDateTime desc"}
+                            reached_read = False
+                            while msg_url and not reached_read:
+                                m_resp = await client.get(msg_url, params=msg_params, headers=headers)
+                                m_resp.raise_for_status()
+                                m_data = m_resp.json()
+                                msg_params = None
+                                for msg in m_data.get("value", []):
+                                    created = _parse_graph_dt(msg.get("createdDateTime") or "")
+                                    if last_read_at and created and created <= last_read_at:
+                                        reached_read = True
+                                        break
+                                    if msg.get("messageType") != "message" or msg.get("deletedDateTime"):
+                                        continue
+                                    sender, sender_id = _message_sender(msg)
+                                    if my_id and sender_id == my_id:
+                                        continue
+                                    if len(messages) >= max_messages_per_chat:
+                                        truncated = True
+                                        reached_read = True
+                                        break
+                                    body = msg.get("body") or {}
+                                    messages.append({
+                                        "id": msg.get("id"),
+                                        "sender": sender,
+                                        "created_at": _to_kst_str(msg.get("createdDateTime") or ""),
+                                        "body": _html_to_text(body.get("content") or "")
+                                                if body.get("contentType") == "html" else (body.get("content") or ""),
+                                        "attachments": len(msg.get("attachments") or []),
+                                    })
+                                msg_url = m_data.get("@odata.nextLink", "")
+                        except httpx.HTTPStatusError as e:
+                            warnings.append(f"채팅({chat_id}) 메시지 조회 실패: HTTP {e.response.status_code}")
+                        messages.sort(key=lambda m: m["created_at"])
+                        chat_out["unread_count"] = len(messages)
+                        chat_out["unread_count_truncated"] = truncated
+                        chat_out["messages"] = messages
+
+                    chats_out.append(chat_out)
+
+            log.info("teams_unread_chats: 확인 %d개, 미확인 %d개", len(chats), total_unread_chats)
+            return {
+                "success": True,
+                "chat_type": chat_type,
+                "checked_chats": len(chats),
+                "unread_chat_count": total_unread_chats,
+                "returned_chat_count": len(chats_out),
+                "chats": chats_out,
+                "note": "조회만 했으며 읽음 처리는 하지 않았습니다. 시각은 KST 기준입니다.",
+                **({"warnings": warnings} if warnings else {}),
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_unread_chats HTTP 오류: %s", e.response.text[:300])
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": "권한 오류(403): Azure AD 앱에 Chat.ReadWrite(또는 Chat.Read) Delegated 권한이 필요합니다.",
+                }
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_unread_chats 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Tool R22: Teams 팀 채널 새 메시지 조회 (기준 시각 이후)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Graph API는 채널 메시지의 사용자별 읽음 상태를 제공하지 않는다.
+    # 따라서 기준 시각(since) 이후 작성된 새 글·새 댓글을 "새 메시지"로 간주한다.
+    # 채널 메시지 delta 조회의 $filter=lastModifiedDateTime gt {since}로 변경분만 받은 뒤
+    # 루트 메시지(새 글)와 replies(새 댓글)를 createdDateTime 기준으로 다시 거른다.
+    _CHANNEL_CONCURRENCY = 5
+
+    @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+    async def teams_channel_new_messages(
+        since: Annotated[str, Field(
+            pattern=r"^(\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?)?$",
+            description="기준 시각(KST) 'YYYY-MM-DD' 또는 'YYYY-MM-DD HH:MM'. 이 시각 이후 작성된 글·댓글을 반환. 비우면 최근 24시간",
+        )] = "",
+        team_name: Annotated[str, Field(description="팀 이름 필터(부분 일치). 비우면 가입한 전체 팀")] = "",
+        channel_name: Annotated[str, Field(description="채널 이름 필터(부분 일치). 비우면 전체 채널")] = "",
+        include_replies: Annotated[bool, Field(description="true(기본)면 기준 시각 이후 달린 댓글도 포함")] = True,
+        max_channels: Annotated[int, Field(ge=1, le=50, description="확인할 최대 채널 수 (기본 30)")] = 30,
+        limit_per_channel: Annotated[int, Field(ge=1, le=50, description="채널당 최대 반환 메시지 수 (기본 20)")] = 20,
+    ) -> dict:
+        """가입한 Teams 팀 채널에서 기준 시각 이후 새로 올라온 글과 댓글을 조회합니다.
+        Graph API는 채널 메시지의 읽음/안읽음 상태를 제공하지 않으므로, Teams 화면의 '읽지 않음' 표시와 정확히 일치하지 않습니다.
+        '마지막으로 확인한 시각'을 since로 넘겨 그 이후의 새 메시지를 확인하는 용도로 사용하세요. 본인이 작성한 글·댓글은 제외합니다.
+        Azure AD 앱에 ChannelMessage.Read.All Delegated 권한 및 관리자 동의가 필요합니다.
+        """
+        auth_err = require_auth()
+        if auth_err:
+            return auth_err
+
+        import asyncio
+        import httpx
+        from datetime import datetime, timedelta, timezone
+        from zoneinfo import ZoneInfo
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
+        KST = ZoneInfo("Asia/Seoul")
+        if since:
+            fmt = "%Y-%m-%d %H:%M" if " " in since else "%Y-%m-%d"
+            try:
+                since_dt = datetime.strptime(since, fmt).replace(tzinfo=KST)
+            except ValueError:
+                return {"success": False, "message": f"since 형식이 올바르지 않습니다: {since}"}
+        else:
+            since_dt = datetime.now(KST) - timedelta(hours=24)
+        since_utc = since_dt.astimezone(timezone.utc)
+        if since_utc > datetime.now(timezone.utc):
+            return {"success": False, "message": "since가 현재 시각보다 미래입니다."}
+        since_filter = since_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        warnings: list[str] = []
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                me_resp = await client.get(
+                    "https://graph.microsoft.com/v1.0/me", params={"$select": "id"}, headers=headers,
+                )
+                me_resp.raise_for_status()
+                my_id = me_resp.json().get("id") or ""
+
+                # 1. 대상 팀·채널 수집
+                teams_resp = await client.get("https://graph.microsoft.com/v1.0/me/joinedTeams", headers=headers)
+                teams_resp.raise_for_status()
+                teams = [
+                    t for t in teams_resp.json().get("value", [])
+                    if not team_name or team_name.lower() in (t.get("displayName") or "").lower()
+                ]
+                if not teams:
+                    return {"success": True, "since": since_dt.strftime("%Y-%m-%d %H:%M"), "channel_count": 0,
+                            "channels": [], "message": "조건에 맞는 가입 팀이 없습니다."}
+
+                targets: list[dict] = []
+                for t in teams:
+                    try:
+                        ch_resp = await client.get(
+                            f"https://graph.microsoft.com/v1.0/teams/{t['id']}/channels",
+                            params={"$select": "id,displayName"},
+                            headers=headers,
+                        )
+                        ch_resp.raise_for_status()
+                        for ch in ch_resp.json().get("value", []):
+                            if channel_name and channel_name.lower() not in (ch.get("displayName") or "").lower():
+                                continue
+                            targets.append({
+                                "team_id": t["id"], "team_name": t.get("displayName"),
+                                "channel_id": ch.get("id"), "channel_name": ch.get("displayName"),
+                            })
+                    except httpx.HTTPStatusError as e:
+                        warnings.append(f"팀 '{t.get('displayName')}' 채널 목록 조회 실패: HTTP {e.response.status_code}")
+
+                total_channels = len(targets)
+                if total_channels > max_channels:
+                    warnings.append(
+                        f"대상 채널이 {total_channels}개라 앞의 {max_channels}개만 확인했습니다. "
+                        "team_name/channel_name으로 범위를 좁히거나 max_channels를 늘리세요."
+                    )
+                    targets = targets[:max_channels]
+
+                # 2. 채널별 변경분 조회 (delta + lastModifiedDateTime 필터)
+                sem = asyncio.Semaphore(_CHANNEL_CONCURRENCY)
+
+                async def _fetch_channel(tg: dict) -> dict:
+                    async with sem:
+                        url = (f"https://graph.microsoft.com/v1.0/teams/{tg['team_id']}"
+                               f"/channels/{tg['channel_id']}/messages/delta")
+                        params: dict | None = {
+                            "$filter": f"lastModifiedDateTime gt {since_filter}",
+                            "$top": 50,
+                        }
+                        if include_replies:
+                            params["$expand"] = "replies"
+                        items: list[dict] = []
+                        try:
+                            while url:
+                                resp = await client.get(url, params=params, headers=headers)
+                                resp.raise_for_status()
+                                data = resp.json()
+                                params = None
+                                for msg in data.get("value", []):
+                                    if msg.get("messageType") != "message":
+                                        continue
+                                    root_created = _parse_graph_dt(msg.get("createdDateTime") or "")
+                                    root_sender, root_sender_id = _message_sender(msg)
+                                    root_text = _html_to_text((msg.get("body") or {}).get("content") or "")
+                                    if (root_created and root_created > since_utc and not msg.get("deletedDateTime")
+                                            and not (my_id and root_sender_id == my_id)):
+                                        items.append({
+                                            "kind": "post",
+                                            "message_id": msg.get("id"),
+                                            "subject": msg.get("subject"),
+                                            "sender": root_sender,
+                                            "created_at_utc": msg.get("createdDateTime") or "",
+                                            "created_at": _to_kst_str(msg.get("createdDateTime") or ""),
+                                            "body": root_text,
+                                            "attachments": len(msg.get("attachments") or []),
+                                            "web_url": msg.get("webUrl"),
+                                        })
+                                    for rep in (msg.get("replies") or []) if include_replies else []:
+                                        if rep.get("messageType") != "message" or rep.get("deletedDateTime"):
+                                            continue
+                                        rep_created = _parse_graph_dt(rep.get("createdDateTime") or "")
+                                        rep_sender, rep_sender_id = _message_sender(rep)
+                                        if not rep_created or rep_created <= since_utc:
+                                            continue
+                                        if my_id and rep_sender_id == my_id:
+                                            continue
+                                        items.append({
+                                            "kind": "reply",
+                                            "message_id": msg.get("id"),
+                                            "reply_id": rep.get("id"),
+                                            "parent_preview": (msg.get("subject") or root_text)[:80],
+                                            "sender": rep_sender,
+                                            "created_at_utc": rep.get("createdDateTime") or "",
+                                            "created_at": _to_kst_str(rep.get("createdDateTime") or ""),
+                                            "body": _html_to_text((rep.get("body") or {}).get("content") or ""),
+                                            "attachments": len(rep.get("attachments") or []),
+                                            "web_url": rep.get("webUrl"),
+                                        })
+                                url = data.get("@odata.nextLink", "")  # 마지막 페이지는 deltaLink만 반환
+                        except httpx.HTTPStatusError as e:
+                            return {**tg, "error_status": e.response.status_code}
+                        except Exception as e:
+                            return {**tg, "error": str(e)}
+                        items.sort(key=lambda m: m["created_at_utc"])
+                        for it in items:
+                            it.pop("created_at_utc", None)
+                        return {**tg, "new_count": len(items), "truncated": len(items) > limit_per_channel,
+                                "messages": items[-limit_per_channel:]}
+
+                results = await asyncio.gather(*(_fetch_channel(tg) for tg in targets))
+
+            forbidden = [r for r in results if r.get("error_status") == 403]
+            if results and len(forbidden) == len(results):
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": (
+                        "권한 오류(403): Azure AD 앱에 'ChannelMessage.Read.All' Delegated 권한과 "
+                        "관리자 동의가 필요합니다. Azure Portal에서 권한을 추가한 뒤 ms365_logout → ms365_login으로 재인증하세요."
+                    ),
+                }
+            channels_out = []
+            for r in results:
+                if r.get("error_status") or r.get("error"):
+                    warnings.append(
+                        f"'{r['team_name']} > {r['channel_name']}' 조회 실패: "
+                        f"{('HTTP ' + str(r['error_status'])) if r.get('error_status') else r.get('error')}"
+                    )
+                    continue
+                if r["new_count"]:
+                    channels_out.append(r)
+            channels_out.sort(key=lambda r: r["new_count"], reverse=True)
+
+            log.info("teams_channel_new_messages: 채널 %d개 확인, 새 메시지 채널 %d개", len(results), len(channels_out))
+            return {
+                "success": True,
+                "since": since_dt.strftime("%Y-%m-%d %H:%M"),
+                "checked_channel_count": len(results),
+                "channel_with_new_count": len(channels_out),
+                "total_new_messages": sum(r["new_count"] for r in channels_out),
+                "channels": channels_out,
+                "note": ("채널 메시지는 Graph API가 읽음 상태를 제공하지 않아 기준 시각 이후 작성된 글·댓글을 반환합니다. "
+                         "시각은 KST 기준입니다."),
+                **({"warnings": warnings} if warnings else {}),
+            }
+        except httpx.HTTPStatusError as e:
+            log.error("teams_channel_new_messages HTTP 오류: %s", e.response.text[:300])
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
+        except Exception as e:
+            log.error("teams_channel_new_messages 실패: %s", e)
+            return {"success": False, "message": str(e)}
+
     log.info(
-        "MS365 Graph API 읽기 도구 20개 등록 완료 "
+        "MS365 Graph API 읽기 도구 22개 등록 완료 "
         "(채팅검색/회의가용/캘린더/이메일/리소스/SP파일/SP폴더/임직원조회/임직원상세/Teams채널조회/그룹채팅/채널메시지/이메일첨부/이메일첨부일괄/"
-        "Excel워크시트목록/Excel범위읽기/사용량보고서/채널댓글조회/채널첨부파일조회/채널이미지조회)"
+        "Excel워크시트목록/Excel범위읽기/사용량보고서/채널댓글조회/채널첨부파일조회/채널이미지조회/미확인채팅/채널새메시지)"
     )

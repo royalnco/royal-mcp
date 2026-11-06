@@ -115,7 +115,7 @@ python server.py --http --port 8080 --host 0.0.0.0
 
 ---
 
-## 제공 도구 목록 (총 59개)
+## 제공 도구 목록 (총 61개)
 
 ### 서버 도구 (server.py) — 3개
 
@@ -129,7 +129,7 @@ python server.py --http --port 8080 --host 0.0.0.0
 
 | 번호 | 도구 | 설명 |
 |------|------|------|
-| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 (body_type='html' 지정 시 굵게·목록·줄바꿈 등 서식 적용) |
+| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 (body_type='html' 지정 시 굵게·목록·줄바꿈 등 서식 적용, `mentions`로 사용자·채널·팀 @멘션 지원) |
 | 2 | `create_sharepoint_file` | SharePoint 텍스트 파일 생성 |
 | 3 | `send_email` | Outlook 이메일 발송 (첨부파일 지원: 로컬 파일 3MB 이하 또는 OneDrive/SharePoint 파일의 사내 전용 공유 링크) |
 | 4 | `create_calendar_event` | 캘린더 일정 생성 (Teams 링크 포함 옵션) |
@@ -148,7 +148,7 @@ python server.py --http --port 8080 --host 0.0.0.0
 | 17 | `onedrive_rename_item` | 파일/폴더 이름 변경 |
 | 18 | `onedrive_move_item` | 파일/폴더 이동 |
 | 19 | `onedrive_delete_item` | 파일/폴더 삭제 (휴지통 이동) |
-| 20 | `onedrive_create_share_link` | 공유 링크 생성 (view/edit, organization/anonymous) |
+| 20 | `onedrive_create_share_link` | 공유 링크 생성 (권한: view/edit/review/blocksDownload, 범위: organization/users/anonymous, 만료일 지정). review·blocksDownload·users 범위는 Graph beta API 사용 |
 | 21 | `onedrive_list_versions` | 파일 버전 목록 조회 |
 | 22 | `outlook_category_list` | Outlook 범주(masterCategories) 목록 조회 |
 | 23 | `outlook_category_create` | Outlook 범주 생성 |
@@ -159,17 +159,17 @@ python server.py --http --port 8080 --host 0.0.0.0
 | 28 | `word_find_replace` | Word 문서(.docx) 본문·표 텍스트 찾기/바꾸기. 변경건수 반환, 0건이면 재업로드 생략 |
 | 29 | `pptx_find_replace` | PowerPoint(.pptx) 슬라이드·표·그룹도형 텍스트 찾기/바꾸기. 변경건수 반환, 0건이면 재업로드 생략 |
 | 30 | `excel_add_worksheet` | Excel 파일에 새 워크시트 추가 (이름 생략 시 자동 명명). 값 입력은 `excel_write_range`를 이어서 호출 |
-| 31 | `update_teams_channel_message` | Teams 채널 메시지 수정 (본문 전체 교체, 답글 수정 지원, 본인이 보낸 메시지만 가능) |
+| 31 | `update_teams_channel_message` | Teams 채널 메시지 수정 (본문 전체 교체, 답글 수정 지원, `mentions`로 사용자·채널·팀 @멘션 지원, 본인이 보낸 메시지만 가능) |
 | 32 | `delete_teams_channel_message` | Teams 채널 메시지 삭제 (Soft Delete, 답글 삭제 지원, 본인이 보낸 메시지만 가능) |
 | 33 | `onedrive_grant_permission` | OneDrive/SharePoint 파일·폴더에 특정 사내 사용자의 read/write 권한 부여 (invite) |
 | 34 | `onedrive_list_permissions` | 파일·폴더에 설정된 권한 목록 조회 (permission_id 확인, 상속·공유링크 여부 포함) |
 | 35 | `onedrive_revoke_permission` | 특정 사용자의 권한 회수 (상속된 권한·다인 공유링크는 회수 거부하고 사유 안내) |
 
-### 읽기 도구 (graph_read.py) — 20개
+### 읽기 도구 (graph_read.py) — 22개
 
 | 번호 | 도구 | 설명 |
 |------|------|------|
-| R1 | `chat_message_search` | Teams 채널·채팅 메시지 키워드 검색 |
+| R1 | `chat_message_search` | Teams 채널·채팅 메시지 키워드 검색 (본문 전체 반환, 단 전체 검색 모드는 검색 엔진 제공 본문) |
 | R2 | `find_meeting_availability` | 참석자 캘린더 가용 시간 조회 (getSchedule) |
 | R3 | `outlook_calendar_search` | 캘린더 일정 검색 (날짜 범위·키워드) |
 | R4 | `outlook_email_search` | 이메일 KQL 키워드 검색 |
@@ -179,16 +179,18 @@ python server.py --http --port 8080 --host 0.0.0.0
 | R8 | `org_users_search` | 임직원·조직 연락처 목록 조회 및 검색 |
 | R9 | `org_user_detail` | 특정 임직원 상세 정보 조회 |
 | R10 | `teams_channels_search` | Teams 팀·채널 이름 검색 및 ID 조회 |
-| R11 | `teams_group_chat_messages` | Teams 그룹 채팅방 메시지 날짜 조회 |
-| R12 | `teams_channel_messages` | Teams 팀 채널 메시지 날짜 조회 |
+| R11 | `teams_group_chat_messages` | Teams 그룹 채팅방 메시지 날짜 조회 (본문 전체 반환) |
+| R12 | `teams_channel_messages` | Teams 팀 채널 메시지 날짜 조회 (본문 전체 반환) |
 | R13 | `read_email_attachment` | 이메일 첨부파일 목록 조회 및 내용 읽기 |
 | R14 | `read_email_attachments_all` | 이메일 1건의 첨부파일 전체 내용을 한 번의 호출로 일괄 읽기 |
 | R15 | `excel_list_worksheets` | Excel 파일의 워크시트 목록 조회 (이름/ID/위치) |
 | R16 | `excel_read_range` | Excel 워크시트 범위 값 조회. address 생략 시 사용 중인 전체 범위(usedRange) 반환 |
 | R17 | `org_usage_report` | 조직 사용량 보고서 조회 (Office365 활성사용자/메일박스/OneDrive/SharePoint/Teams활동/Teams기기/이메일활동). Reports Reader 이상 관리자 계정 필요 |
-| R18 | `teams_channel_message_replies` | Teams 채널 메시지의 댓글(스레드 답글) 목록 조회 |
+| R18 | `teams_channel_message_replies` | Teams 채널 메시지의 댓글(스레드 답글) 목록 조회 (본문 전체 반환) |
 | R19 | `teams_channel_message_attachments` | Teams 채널 메시지(또는 답글)의 첨부파일·카드 목록 조회 (파일 내용은 content_url을 sharepoint_search/read_resource로 재조회) |
 | R20 | `teams_channel_message_images` | Teams 채널 메시지(또는 답글) 본문의 인라인 이미지 조회 (목록만/개별 이미지 base64, 3MB 초과 시 반환 안 함) |
+| R21 | `teams_unread_chats` | Teams 채팅(1:1·그룹·회의) 중 읽지 않은 메시지가 있는 채팅과 미확인 메시지 조회. 채팅 목록의 `viewpoint.lastMessageReadDateTime`(마지막으로 읽은 시각) 기준, 본인 메시지 제외, 읽음 처리는 하지 않음 |
+| R22 | `teams_channel_new_messages` | 가입 팀 채널에서 기준 시각(since, 기본 최근 24시간) 이후 작성된 새 글·댓글 조회. Graph API가 채널 읽음 상태를 제공하지 않아 Teams 화면의 '읽지 않음'과 다를 수 있음. 채널 메시지 delta(`lastModifiedDateTime gt` 필터, `replies` 확장) 사용 |
 
 ### 기간계 DB ERP 도구 (erp/insa.py) — 1개
 
@@ -210,6 +212,12 @@ python server.py --http --port 8080 --host 0.0.0.0
 | `drive_id` + `item_id` | 파일 내용을 내려받지 않고, 사내 전용(`organizationView`) 공유 링크를 생성해 링크 첨부(referenceAttachment) | drive_id/item_id는 `sharepoint_search`로 확인. 수신자가 사내 계정으로 로그인해야 열람 가능. 파일 크기 제약 없음(HTTP 모드에서도 사용 가능) |
 
 3MB(또는 로컬 첨부 합계 3MB)를 초과하는 파일은 `onedrive_upload_file`로 먼저 업로드한 뒤 `drive_id`+`item_id`로 첨부하도록 안내한다. `outlook_email_reply`/`reply_all`/`forward`는 첨부파일이 있으면 `body_type` 설정과 무관하게 내부적으로 초안(Draft) 경유 방식으로 전환되며, 첨부 처리 중 오류가 발생하면 초안을 정리(삭제)하고 발송하지 않는다.
+
+---
+
+## Teams @멘션 (graph.py — _build_mention_body)
+
+`send_teams_channel_message`, `update_teams_channel_message`는 `mentions` 목록을 지원한다. 항목은 예약어 `channel`(현재 채널 → `mentioned.conversation`, conversationIdentityType=channel, 표시 이름은 채널명), `team`(현재 팀 → conversationIdentityType=team, 표시 이름은 팀명) 또는 사용자 이메일(`/users/{email}` 조회 → `mentioned.user`)이며 예약어는 대소문자를 구분하지 않는다. 대상별 ID·표시 이름을 조회한 뒤 본문의 `{mention0}`, `{mention1}`… 자리표시자를 `<at id="N">표시이름</at>`으로 치환한 뒤 Graph `mentions` 배열을 함께 보낸다. 자리표시자가 없으면 본문 맨 앞에 멘션을 붙이며, 멘션이 있으면 body_type과 무관하게 HTML로 발송한다(`text`는 이스케이프 후 줄바꿈을 `<br>`로 변환). 같은 자리표시자 중복 사용, 범위를 벗어난 자리표시자, 존재하지 않는 사용자, 채널명·팀명 조회 실패는 발송 전에 오류로 반환한다. 반환값 `mentioned`는 `[{type: user|channel|team, name, target}]` 형식이다. 예: 주간보고 공지 `mentions=["channel"], message="<p>{mention0}</p><p>임원보고자료 ...</p>"`
 
 ---
 
@@ -276,7 +284,7 @@ OneDrive/SharePoint 파일을 다운로드 후 메모리 내에서 텍스트 추
 | `.env` 인식 안 됨 | `.env.txt`로 저장됨 | 파일 형식 확인, 확장자 제거 |
 | `Activate.ps1` 실행 오류 | PowerShell 실행 정책 제한 | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | 로그인 후 권한 오류 | Azure AD 동의 미완료 | 관리자에게 Azure AD 권한 동의 요청 |
-| `teams_channel_messages`/`teams_channel_message_replies`/`teams_channel_message_attachments`/`teams_channel_message_images` 403 오류 | `ChannelMessage.Read.All` 관리자 동의 미완료 | Azure Portal에서 `ChannelMessage.Read.All` 권한 추가 후 재로그인 |
+| `teams_channel_messages`/`teams_channel_message_replies`/`teams_channel_message_attachments`/`teams_channel_message_images`/`teams_channel_new_messages` 403 오류 | `ChannelMessage.Read.All` 관리자 동의 미완료 | Azure Portal에서 `ChannelMessage.Read.All` 권한 추가 후 재로그인 |
 | `update_teams_channel_message`/`delete_teams_channel_message` 403 오류 | `ChannelMessage.ReadWrite` 미동의, 또는 본인이 보낸 메시지가 아님 | Azure Portal에서 `ChannelMessage.ReadWrite` 권한 추가 후 재로그인. 타인이 보낸 메시지는 Graph API 정책상 수정·삭제 불가 |
 | 임직원 조회 결과 없음 | `User.Read.All` 관리자 동의 미완료 | Azure Portal에서 `User.Read.All` 권한 추가 |
 | `org_usage_report` 403 오류 | 로그인 계정에 Reports Reader 이상 관리자 역할 없음, 또는 권한 추가 후 재로그인 안 함 | Azure AD에서 계정에 Reports Reader 역할 부여 + `ms365_logout` → `ms365_login` 재인증 |

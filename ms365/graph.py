@@ -150,6 +150,113 @@ async def _resolve_attachments(
 
     return graph_attachments, errors
 
+
+_MENTION_RESERVED = {"channel", "team"}  # mentions 예약어: 현재 채널 / 현재 팀
+
+
+async def _resolve_mention_target(client, headers: dict, target: str, team_id: str, channel_id: str) -> tuple:
+    """멘션 대상 1건을 조회한다. 반환값: (종류, 표시 이름, Graph mentioned 객체)
+
+    - "channel": 메시지를 보내는 채널 (GET /teams/{team}/channels/{channel})
+    - "team"   : 해당 팀 (GET /teams/{team})
+    - 그 외    : 사용자 이메일 (GET /users/{email})
+    """
+    kind = target.lower()
+    if kind == "channel":
+        resp = await client.get(
+            f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}",
+            params={"$select": "id,displayName"},
+            headers=headers,
+        )
+        if resp.status_code in (403, 404):
+            raise ValueError(f"채널 멘션용 채널명을 조회하지 못했습니다(HTTP {resp.status_code}). "
+                             "team_id/channel_id와 Channel.ReadBasic.All 권한을 확인하세요.")
+        resp.raise_for_status()
+        name = resp.json().get("displayName") or "채널"
+        return "channel", name, {
+            "conversation": {"id": channel_id, "displayName": name, "conversationIdentityType": "channel"},
+        }
+    if kind == "team":
+        resp = await client.get(
+            f"https://graph.microsoft.com/v1.0/teams/{team_id}",
+            params={"$select": "id,displayName"},
+            headers=headers,
+        )
+        if resp.status_code in (403, 404):
+            raise ValueError(f"팀 멘션용 팀명을 조회하지 못했습니다(HTTP {resp.status_code}). "
+                             "team_id와 Team.ReadBasic.All 권한을 확인하세요.")
+        resp.raise_for_status()
+        name = resp.json().get("displayName") or "팀"
+        return "team", name, {
+            "conversation": {"id": team_id, "displayName": name, "conversationIdentityType": "team"},
+        }
+
+    resp = await client.get(
+        f"https://graph.microsoft.com/v1.0/users/{target}",
+        params={"$select": "id,displayName"},
+        headers=headers,
+    )
+    if resp.status_code == 404:
+        raise ValueError(f"멘션 대상 사용자를 찾을 수 없습니다: {target}")
+    resp.raise_for_status()
+    user = resp.json()
+    name = user.get("displayName") or target
+    return "user", name, {"user": {"id": user["id"], "displayName": name, "userIdentityType": "aadUser"}}
+
+
+async def _build_mention_body(
+    client, headers: dict, message: str, body_type: str, mention_targets: List[str],
+    team_id: str, channel_id: str,
+) -> tuple:
+    """Teams 채널 메시지 본문에 @멘션을 적용한다.
+    반환값: (html 본문, Graph mentions 배열, [{"type": user|channel|team, "name": 표시이름, "target": 입력값}])
+
+    mention_targets의 각 항목은 예약어 "channel"(현재 채널), "team"(현재 팀) 또는 사용자 이메일이다.
+    대상별 ID·표시 이름을 조회한 뒤 본문의 {mention0}, {mention1}… 자리표시자를
+    <at id="N">표시이름</at>으로 치환한다. 자리표시자가 없는 멘션은 본문 맨 앞에 붙인다.
+    멘션은 HTML 본문에서만 동작하므로 body_type='text'이면 본문을 HTML 이스케이프하고
+    줄바꿈을 <br>로 바꿔 HTML로 변환한다. 조회 실패나 잘못된 자리표시자는 ValueError로 알린다.
+    """
+    import html
+    import re
+
+    targets: List[str] = []
+    for t in mention_targets:
+        t = (t or "").strip()
+        if t and t.lower() not in {x.lower() for x in targets}:
+            targets.append(t)
+
+    content = html.escape(message).replace("\n", "<br>") if body_type == "text" else message
+
+    used = {int(n) for n in re.findall(r"\{mention(\d+)\}", content)}
+    invalid = sorted(n for n in used if n >= len(targets))
+    if invalid:
+        raise ValueError(
+            f"본문의 자리표시자 {', '.join('{mention%d}' % n for n in invalid)}에 대응하는 멘션 대상이 없습니다 "
+            f"(mentions는 {len(targets)}개, 자리표시자는 {{mention0}}부터 시작)."
+        )
+    for i in used:
+        if content.count("{mention%d}" % i) > 1:
+            raise ValueError("자리표시자 {mention%d}가 여러 번 사용되었습니다. 같은 대상은 한 번만 멘션할 수 있습니다." % i)
+
+    mentions_payload: List[dict] = []
+    summary: List[dict] = []
+    prefix_tags: List[str] = []
+    for i, target in enumerate(targets):
+        kind, name, mentioned = await _resolve_mention_target(client, headers, target, team_id, channel_id)
+        tag = f'<at id="{i}">{html.escape(name)}</at>'
+        if i in used:
+            content = content.replace("{mention%d}" % i, tag)
+        else:
+            prefix_tags.append(tag)
+        mentions_payload.append({"id": i, "mentionText": name, "mentioned": mentioned})
+        summary.append({"type": kind, "name": name, "target": target})
+
+    if prefix_tags:
+        content = f"<p>{' '.join(prefix_tags)}</p>{content}"
+    return content, mentions_payload, summary
+
+
 _VALID_CATEGORY_COLORS = {
     "none", "preset0", "preset1", "preset2", "preset3", "preset4",
     "preset5", "preset6", "preset7", "preset8", "preset9", "preset10",
@@ -255,52 +362,97 @@ def register_ms365_tools(mcp):
         body_type: Annotated[Literal["text", "html"], Field(
             description="본문 형식: 'html'(기본, 굵게·목록·줄바꿈 등 서식 적용) 또는 'text'(서식 없는 순수 텍스트)",
         )] = "html",
+        mentions: Annotated[Optional[List[str]], Field(
+            description="@멘션 대상 목록. 각 항목은 예약어 'channel'(이 메시지를 보내는 채널 전체), "
+                        "'team'(해당 팀 전체) 또는 사용자 이메일(예: 'hong@iroyal.kr')입니다. "
+                        "본문의 {mention0}, {mention1}… 자리표시자가 순서대로 '@표시이름'으로 바뀌며, "
+                        "자리표시자가 없으면 본문 맨 앞에 멘션이 붙습니다. org_users_search로 이메일을 확인할 수 있습니다.",
+        )] = None,
     ) -> dict:
-        """Teams 채널에 메시지를 전송합니다.
+        """Teams 채널에 메시지를 전송합니다. 사용자·채널·팀 @멘션을 포함할 수 있습니다.
         team_id와 channel_id는 MS365 read MCP의 chat_message_search 도구로 미리 확인하세요.
 
         body_type 기본값은 'html'이며, message에는 Teams가 지원하는 HTML 요소를 사용하세요(아래 목록).
         서식 없는 순수 텍스트만 보낼 때는 body_type='text'로 지정하세요. contentType이 'text'이면
         줄바꿈(\\n)이나 HTML 태그가 서식으로 해석되지 않고 무시되거나 그대로 노출됩니다.
 
+        @멘션 사용법:
+        - mentions 항목: 'channel'(현재 채널, 표시 이름은 채널명), 'team'(현재 팀, 표시 이름은 팀명),
+          그 외 문자열은 사용자 이메일로 처리합니다. 예약어는 대소문자를 구분하지 않습니다.
+        - message에서 멘션할 위치에 {mention0}, {mention1}…을 mentions 순서대로 적습니다.
+          예) 채널 전체 공지: mentions=['channel'], message='<p>{mention0}</p><p>임원보고자료 ...</p>'
+          예) 채널 + 담당자: mentions=['channel', 'hong@iroyal.kr'],
+              message='<p>{mention0}</p><p>{mention1}님, 견적서 검토 부탁드립니다.</p>'
+          예) 팀 전체: mentions=['team'], message='<p>{mention0} 전사 공지입니다.</p>'
+        - 자리표시자를 생략하면 멘션이 본문 맨 앞에 붙습니다. 같은 자리표시자는 한 번만 쓸 수 있습니다.
+        - 멘션된 사용자, 채널·팀 구성원에게 Teams 알림이 갑니다(채널·팀 멘션 알림은 각자의 알림 설정을 따름).
+          멘션이 있으면 body_type='text'여도 자동으로 HTML로 변환해 발송합니다.
+        - <at> 태그를 직접 작성하지 마세요. mentions 배열과 짝이 맞지 않으면 멘션이 동작하지 않습니다.
+        - 반환값 mentioned에 멘션 종류(user/channel/team)와 표시 이름이 함께 표시됩니다.
+
         Teams 채널 메시지가 공식 지원하는 HTML 서식 요소:
         - 일반 태그: <p>, <div>, <br>, <b>, <ul>/<ol>/<li>, 표 등 Teams가 지원하는 서식 있는 텍스트의 부분집합
-        - <at>: 사용자·팀·채널 멘션 (mentions 배열과 함께 사용, 이 도구는 미지원)
+        - <at>: 사용자·채널·팀 멘션 (mentions 파라미터로 자동 생성)
         - <emoji>, <customemoji>: 이모지
         - <codeblock>: 코드 블록 (언어별 문법 강조는 적용되지 않음)
 
         Azure AD 앱에 ChannelMessage.Send Delegated 권한이 필요합니다.
+        멘션 대상 조회에는 User.Read.All(사용자), Channel.ReadBasic.All(채널명), Team.ReadBasic.All(팀명)을 사용합니다.
+        발송 전 반드시 사용자에게 채널, 멘션 대상, 메시지 내용을 확인받으세요.
         """
         auth_err = require_auth()
         if auth_err:
             return auth_err
-        graph = get_graph_client()
+
+        from ms365.auth import get_access_token
+        import httpx
+
+        access_token = get_access_token()
+        if not access_token:
+            return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
+
         await fetch_user_profile()
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        url = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages"
+
         try:
-            from msgraph.generated.models.chat_message import ChatMessage
-            from msgraph.generated.models.item_body import ItemBody
-            from msgraph.generated.models.body_type import BodyType
+            async with httpx.AsyncClient(timeout=30) as client:
+                if mentions:
+                    content, mentions_payload, mention_summary = await _build_mention_body(
+                        client, headers, message, body_type, mentions, team_id, channel_id,
+                    )
+                    payload = {"body": {"contentType": "html", "content": content}, "mentions": mentions_payload}
+                else:
+                    mentions_payload, mention_summary = [], []
+                    payload = {"body": {"contentType": body_type, "content": message}}
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
 
-            body = ChatMessage()
-            body.body = ItemBody()
-            body.body.content_type = BodyType.Html if body_type == "html" else BodyType.Text
-            body.body.content = message
-
-            result = await (
-                graph.teams.by_team_id(team_id)
-                .channels.by_channel_id(channel_id)
-                .messages.post(body)
-            )
-            log.info("send_teams_channel_message: team=%s channel=%s id=%s body_type=%s (by %s)",
-                     team_id, channel_id, result.id, body_type, get_user_email())
+            sent_body_type = "html" if mentions_payload else body_type
+            log.info("send_teams_channel_message: team=%s channel=%s id=%s body_type=%s mentions=%d (by %s)",
+                     team_id, channel_id, data.get("id"), sent_body_type, len(mentions_payload), get_user_email())
             return {
                 "success": True,
-                "message_id": result.id,
+                "message_id": data.get("id"),
                 "team_id": team_id,
                 "channel_id": channel_id,
-                "body_type": body_type,
+                "body_type": sent_body_type,
+                "mentioned": mention_summary,
+                "web_url": data.get("webUrl"),
                 "sent_by": get_user_email(),
             }
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
+        except httpx.HTTPStatusError as e:
+            log.error("send_teams_channel_message HTTP 오류: %s — %s", e.response.status_code, e.response.text)
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": "권한 오류(403): Azure AD 앱에 'ChannelMessage.Send' Delegated 권한이 필요하거나, 해당 채널의 구성원이 아닙니다.",
+                }
+            return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
         except Exception as e:
             log.error("send_teams_channel_message 실패: %s", e)
             return {"success": False, "message": str(e)}
@@ -1730,17 +1882,46 @@ def register_ms365_tools(mcp):
     async def onedrive_create_share_link(
         drive_id: Annotated[str, Field(min_length=1, description="드라이브 ID (sharepoint_search 반환 drive_id)")],
         item_id: Annotated[str, Field(min_length=1, description="파일/폴더 ID (sharepoint_search 반환 item_id)")],
-        link_type: Annotated[str, Field(description="링크 유형: view(읽기 전용), edit(편집 가능)")] = "view",
-        scope: Annotated[str, Field(description="공유 범위: organization(사내 전용, 권장), anonymous(외부 공유 — 회사 정책 확인 필요)")] = "organization",
+        link_type: Annotated[Literal["view", "edit", "review", "blocksDownload"], Field(
+            description="링크 권한: view(읽기 전용), edit(편집 가능), review(검토 — 주석만 가능, beta), "
+                        "blocksDownload(읽기 전용 + 다운로드 차단, beta, 파일만)",
+        )] = "view",
+        scope: Annotated[Literal["organization", "users", "anonymous"], Field(
+            description="공유 범위: organization(사내 전체, 권장), users(recipients에 지정한 특정 사용자만, beta), "
+                        "anonymous(로그인 없이 누구나 — 외부 공유, 회사 정책 확인 필요)",
+        )] = "organization",
+        recipients: Annotated[Optional[List[str]], Field(
+            description="scope='users'일 때 링크를 사용할 수 있는 사용자 이메일 목록 (예: ['hong@iroyal.kr']). 다른 scope에서는 지정하지 않습니다.",
+        )] = None,
+        send_notification: Annotated[bool, Field(
+            description="scope='users'일 때 recipients에게 공유 링크 안내 이메일을 발송할지 여부 (기본 false, beta)",
+        )] = False,
+        expiration_date: Annotated[str, Field(
+            pattern=r"^(\d{4}-\d{2}-\d{2})?$",
+            description="링크 만료일 YYYY-MM-DD (한국시간 해당일 23:59:59까지 유효). 비우면 만료 없음(조직 기본 정책을 따름)",
+        )] = "",
     ) -> dict:
-        """OneDrive/SharePoint 파일 또는 폴더의 공유 링크를 생성합니다.
-        anonymous(외부 공유)는 테넌트 정책에서 허용한 경우에만 동작합니다.
+        """OneDrive/SharePoint 파일 또는 폴더의 공유 링크를 권한(읽기/편집 등)과 범위를 지정해 생성합니다.
+        drive_id/item_id는 sharepoint_search로 확인하세요.
+
+        - link_type: view(읽기) / edit(편집) / review(검토) / blocksDownload(다운로드 차단 읽기)
+        - scope: organization(사내 전체) / users(특정 사용자) / anonymous(외부 공유)
+        - view·edit + organization·anonymous 조합은 Graph v1.0(정식) API를 사용합니다.
+          review, blocksDownload, scope='users'(recipients), send_notification은 Graph beta API를 사용하므로
+          Microsoft 정책 변경에 따라 동작이 달라질 수 있습니다. 응답의 api_version으로 사용된 API를 확인할 수 있습니다.
+        - 특정 사용자에게 링크 없이 직접 권한만 주려면 onedrive_grant_permission(정식 API)을 사용하는 편이 더 안정적입니다.
+        - 같은 유형·범위의 링크가 이미 있으면 Graph API가 새 링크를 만들지 않고 기존 링크를 반환합니다(created=false).
+          이 경우 expiration_date는 반영되지 않을 수 있으니 응답의 expiration_datetime을 확인하세요.
+        - anonymous는 테넌트 정책에서 허용한 경우에만 동작하며, 만료일 등은 조직 정책에 의해 거부·조정될 수 있습니다.
+        실행 전 반드시 사용자에게 대상 파일, 권한(link_type), 범위(scope)를 확인받으세요.
+        생성된 링크는 onedrive_list_permissions로 확인하고 onedrive_revoke_permission으로 삭제할 수 있습니다.
         Azure AD 앱에 Files.ReadWrite.All 또는 Sites.ReadWrite.All 권한이 필요합니다.
         """
-        if link_type not in {"view", "edit"}:
-            return {"success": False, "message": "link_type은 'view' 또는 'edit'이어야 합니다."}
-        if scope not in {"organization", "anonymous"}:
-            return {"success": False, "message": "scope는 'organization' 또는 'anonymous'이어야 합니다."}
+        recipient_emails = [r.strip() for r in (recipients or []) if r and r.strip()]
+        if scope == "users" and not recipient_emails:
+            return {"success": False, "message": "scope='users'이면 recipients에 사용자 이메일을 1개 이상 지정해야 합니다."}
+        if scope != "users" and recipient_emails:
+            return {"success": False, "message": "recipients는 scope='users'일 때만 지정할 수 있습니다."}
 
         auth_err = require_auth()
         if auth_err:
@@ -1753,26 +1934,66 @@ def register_ms365_tools(mcp):
         if not access_token:
             return {"success": False, "message": "MS365 토큰을 가져오는데 실패했습니다. ms365_login을 다시 호출해주세요."}
 
+        payload: dict = {"type": link_type, "scope": scope}
+        if expiration_date:
+            from datetime import datetime, timezone
+            from zoneinfo import ZoneInfo
+            try:
+                exp_kst = datetime.strptime(expiration_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=ZoneInfo("Asia/Seoul"),
+                )
+            except ValueError:
+                return {"success": False, "message": f"expiration_date 형식이 올바르지 않습니다: {expiration_date}"}
+            if exp_kst <= datetime.now(timezone.utc):
+                return {"success": False, "message": "expiration_date는 오늘 이후 날짜여야 합니다."}
+            payload["expirationDateTime"] = exp_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if recipient_emails:
+            payload["recipients"] = [{"email": e} for e in recipient_emails]
+            payload["sendNotification"] = send_notification
+
+        # v1.0은 view/edit 유형과 recipients 없는 요청만 지원 → 그 외는 beta 사용
+        use_beta = link_type in {"review", "blocksDownload"} or scope == "users"
+        api_version = "beta" if use_beta else "v1.0"
+
         await fetch_user_profile()
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/createLink"
+        url = f"https://graph.microsoft.com/{api_version}/drives/{drive_id}/items/{item_id}/createLink"
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(url, json={"type": link_type, "scope": scope}, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
             link = data.get("link", {})
-            log.info("onedrive_create_share_link: drive=%s item=%s type=%s scope=%s (by %s)", drive_id, item_id, link_type, scope, get_user_email())
+            log.info("onedrive_create_share_link: drive=%s item=%s type=%s scope=%s recipients=%s api=%s status=%s (by %s)",
+                     drive_id, item_id, link_type, scope, recipient_emails or "-", api_version,
+                     resp.status_code, get_user_email())
             return {
                 "success": True,
+                "created": resp.status_code == 201,
+                "permission_id": data.get("id"),
+                "roles": data.get("roles", []),
                 "link_type": link.get("type"),
                 "scope": link.get("scope"),
                 "web_url": link.get("webUrl"),
+                "expiration_datetime": data.get("expirationDateTime"),
+                "recipients": recipient_emails,
+                "api_version": api_version,
                 "created_by": get_user_email(),
             }
         except httpx.HTTPStatusError as e:
+            log.error("onedrive_create_share_link HTTP 오류: %s — %s", e.response.status_code, e.response.text)
+            if e.response.status_code == 403:
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "message": "권한 오류(403): 해당 파일의 공유 권한이 없거나, 테넌트 공유 정책에서 이 범위(scope)의 링크를 허용하지 않습니다. "
+                               f"상세: {e.response.text[:300]}",
+                }
+            if e.response.status_code == 404:
+                return {"success": False, "status_code": 404, "message": f"파일/폴더를 찾을 수 없습니다: {item_id}"}
             return {"success": False, "status_code": e.response.status_code, "message": e.response.text[:300]}
         except Exception as e:
+            log.error("onedrive_create_share_link 실패: %s", e)
             return {"success": False, "message": str(e)}
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2728,11 +2949,18 @@ def register_ms365_tools(mcp):
         message: Annotated[str, Field(min_length=1, description="변경할 메시지 본문 전체 (기존 본문 전체를 대체하며, body_type='html'이면 HTML 마크업 문자열)")],
         body_type: Annotated[Literal["text", "html"], Field(description="본문 형식: 'html'(기본) 또는 'text'")] = "html",
         reply_id: Annotated[str, Field(description="답글(스레드 댓글)을 수정할 경우 답글 메시지 ID. 원본 채널 메시지를 수정할 때는 비워둡니다.")] = "",
+        mentions: Annotated[Optional[List[str]], Field(
+            description="@멘션 대상 목록: 예약어 'channel'(현재 채널), 'team'(현재 팀) 또는 사용자 이메일. "
+                        "사용법은 send_teams_channel_message와 같습니다"
+                        "(본문의 {mention0}, {mention1}… 자리표시자 치환, 없으면 본문 맨 앞에 추가). "
+                        "예) 기존 공지에 채널 멘션 추가: mentions=['channel'], message='<p>{mention0}</p><p>(기존 본문)</p>'",
+        )] = None,
     ) -> dict:
         """Teams 채널 메시지를 수정합니다. 본문 전체가 message 내용으로 교체됩니다(부분 수정 불가).
         message_id는 chat_message_search 또는 teams_channel_messages 도구로 먼저 확인하세요.
         해당 도구가 반환한 항목이 답글(reply)이면 reply_id에 답글 ID를 지정하세요.
         본인이 보낸 메시지만 수정할 수 있습니다(Graph API 제약).
+        기존 멘션을 유지하려면 mentions에 해당 사용자를 다시 지정해야 합니다(본문 전체 교체 방식이기 때문).
         Azure AD 앱에 ChannelMessage.ReadWrite Delegated 권한이 필요합니다
         (기존 ChannelMessage.Send 권한과는 별개로 관리자 동의를 추가로 받아야 합니다).
         수정 전 반드시 사용자에게 변경 내용을 확인받으세요.
@@ -2753,23 +2981,34 @@ def register_ms365_tools(mcp):
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         base = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages/{message_id}"
         url = f"{base}/replies/{reply_id}" if reply_id else base
-        payload = {"body": {"contentType": body_type, "content": message}}
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
+                if mentions:
+                    content, mentions_payload, mention_summary = await _build_mention_body(
+                        client, headers, message, body_type, mentions, team_id, channel_id,
+                    )
+                    payload = {"body": {"contentType": "html", "content": content}, "mentions": mentions_payload}
+                else:
+                    mentions_payload, mention_summary = [], []
+                    payload = {"body": {"contentType": body_type, "content": message}}
                 resp = await client.patch(url, json=payload, headers=headers)
                 resp.raise_for_status()
 
-            log.info("update_teams_channel_message: team=%s channel=%s message=%s reply=%s body_type=%s (by %s)",
-                     team_id, channel_id, message_id, reply_id or "-", body_type, get_user_email())
+            sent_body_type = "html" if mentions_payload else body_type
+            log.info("update_teams_channel_message: team=%s channel=%s message=%s reply=%s body_type=%s mentions=%d (by %s)",
+                     team_id, channel_id, message_id, reply_id or "-", sent_body_type, len(mentions_payload), get_user_email())
             return {
                 "success": True,
                 "message_id": reply_id or message_id,
                 "team_id": team_id,
                 "channel_id": channel_id,
-                "body_type": body_type,
+                "body_type": sent_body_type,
+                "mentioned": mention_summary,
                 "updated_by": get_user_email(),
             }
+        except ValueError as e:
+            return {"success": False, "message": str(e)}
         except httpx.HTTPStatusError as e:
             log.error("update_teams_channel_message HTTP 오류: %s — %s", e.response.status_code, e.response.text)
             if e.response.status_code == 403:
