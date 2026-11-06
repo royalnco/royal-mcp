@@ -129,11 +129,11 @@ python server.py --http --port 8080 --host 0.0.0.0
 
 | 번호 | 도구 | 설명 |
 |------|------|------|
-| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 (body_type='html' 지정 시 굵게·목록·줄바꿈 등 서식 적용, `mentions`로 사용자·채널·팀 @멘션 지원) |
+| 1 | `send_teams_channel_message` | Teams 채널 메시지 발송 (body_type='html' 지정 시 굵게·목록·줄바꿈 등 서식 적용, `mentions`로 사용자·채널·팀 @멘션 지원, `attachments`로 파일 카드(미리보기) 첨부 지원) |
 | 2 | `create_sharepoint_file` | SharePoint 텍스트 파일 생성 |
 | 3 | `send_email` | Outlook 이메일 발송 (첨부파일 지원: 로컬 파일 3MB 이하 또는 OneDrive/SharePoint 파일의 사내 전용 공유 링크) |
 | 4 | `create_calendar_event` | 캘린더 일정 생성 (Teams 링크 포함 옵션) |
-| 5 | `send_teams_chat_message` | Teams 1:1 채팅 메시지 발송 |
+| 5 | `send_teams_chat_message` | Teams 채팅 메시지 발송 (`recipient_email`로 1:1, `chat_id`로 기존 그룹·회의 채팅 지정, `body_type` text/html, `attachments`로 파일 카드(미리보기) 첨부 지원) |
 | 6 | `outlook_email_update_category` | 이메일 범주(Category) 설정 |
 | 7 | `update_calendar_event` | 캘린더 일정 수정 |
 | 8 | `delete_calendar_event` | 캘린더 일정 삭제 |
@@ -218,6 +218,33 @@ python server.py --http --port 8080 --host 0.0.0.0
 ## Teams @멘션 (graph.py — _build_mention_body)
 
 `send_teams_channel_message`, `update_teams_channel_message`는 `mentions` 목록을 지원한다. 항목은 예약어 `channel`(현재 채널 → `mentioned.conversation`, conversationIdentityType=channel, 표시 이름은 채널명), `team`(현재 팀 → conversationIdentityType=team, 표시 이름은 팀명) 또는 사용자 이메일(`/users/{email}` 조회 → `mentioned.user`)이며 예약어는 대소문자를 구분하지 않는다. 대상별 ID·표시 이름을 조회한 뒤 본문의 `{mention0}`, `{mention1}`… 자리표시자를 `<at id="N">표시이름</at>`으로 치환한 뒤 Graph `mentions` 배열을 함께 보낸다. 자리표시자가 없으면 본문 맨 앞에 멘션을 붙이며, 멘션이 있으면 body_type과 무관하게 HTML로 발송한다(`text`는 이스케이프 후 줄바꿈을 `<br>`로 변환). 같은 자리표시자 중복 사용, 범위를 벗어난 자리표시자, 존재하지 않는 사용자, 채널명·팀명 조회 실패는 발송 전에 오류로 반환한다. 반환값 `mentioned`는 `[{type: user|channel|team, name, target}]` 형식이다. 예: 주간보고 공지 `mentions=["channel"], message="<p>{mention0}</p><p>임원보고자료 ...</p>"`
+
+---
+
+## Teams 채널·채팅 메시지 첨부파일 (graph.py — TeamsAttachment)
+
+`send_teams_channel_message`와 `send_teams_chat_message`는 `attachments` 목록을 지원한다. 아래 표와 규칙은 채널 기준이며, 채팅의 차이는 이 절 끝의 "채팅 첨부"에 정리한다. Teams 첨부는 파일을 메시지에 싣지 않고 SharePoint 파일을 참조(`contentType: "reference"`)하며, Teams가 SharePoint 썸네일로 파일 카드(미리보기)를 그린다.
+
+| 지정 방식 | 동작 | 제약 |
+|-----------|------|------|
+| `local_path` | `GET /teams/{team}/channels/{channel}/filesFolder`로 채널 폴더(채널 '파일' 탭)를 찾아 그 루트에 업로드(4MB 초과 시 업로드 세션) 후 참조 첨부 | 파일당 250MB 이하. **STDIO 모드에서만 허용**(HTTP 모드는 서버 파일시스템 접근 위험으로 거부). 채널 폴더가 아직 없으면(채널 '파일' 탭을 한 번도 안 연 경우) 오류 |
+| `drive_id` + `item_id` | 업로드 없이 기존 파일 정보(eTag, webUrl)를 조회해 참조 첨부 | 채널 구성원에게 해당 파일 열람 권한이 있어야 카드가 열림. 폴더는 거부 |
+
+- 첨부 ID는 driveItem `eTag`(`"{GUID},N"`)의 GUID이며, 본문 끝에 `<attachment id="GUID"></attachment>`를 첨부 순서대로 붙인다. 첨부가 있으면 body_type과 무관하게 HTML로 발송한다(`text`는 이스케이프 후 줄바꿈을 `<br>`로 변환).
+- `contentUrl`은 driveItem `webUrl`을 쓰되, Office 웹 뷰어 주소(`_layouts/15/Doc.aspx`)로 오면 채널 폴더 webUrl + 파일명으로 대체한다.
+- `file_conflict`: `rename`(기본, 같은 이름이 있으면 새 이름으로 저장해 이전 메시지의 첨부 보존) 또는 `replace`(덮어쓰기).
+- 입력 검증 오류나 업로드·조회 실패가 하나라도 있으면 메시지를 발송하지 않는다. 이미 업로드된 파일은 채널 폴더에 남고 반환값 `uploaded`에 표시된다.
+- 반환값: `attachments`(`[{name, url}]`), `uploaded`(`[{source, name, size, drive_id, item_id, web_url}]`).
+- 업로드 직후에는 SharePoint 썸네일이 생성되기 전이라 잠시 아이콘만 보일 수 있다.
+- 필요 권한: `ChannelMessage.Send` + `Files.ReadWrite.All`(또는 `Sites.ReadWrite.All`).
+
+**채팅 첨부 (`send_teams_chat_message`)**
+- 발송 대상: `recipient_email`(1:1 채팅방 생성 또는 재사용)과 `chat_id`(기존 그룹·회의·1:1 채팅) 중 하나만 지정한다. 새 그룹 채팅은 만들지 않는다.
+- `local_path` 업로드 위치: 본인 OneDrive 루트의 `Microsoft Teams Chat Files` 또는 `Microsoft Teams 채팅 파일` 폴더(Teams 앱이 채팅 첨부에 쓰는 폴더). 둘 다 없으면 `Microsoft Teams Chat Files`를 만든다.
+- 권한: Graph API로 올린 파일은 자동 공유되지 않으므로, 발송 전에 본인을 제외한 채팅 참여자 전원(`/chats/{id}/members`의 userId)에게 `/invite`로 읽기 권한을 부여한다(`requireSignIn=true`, `sendInvitation=false`). `drive_id`+`item_id`로 지정한 기존 파일에도 같은 권한을 부여하며, 부여에 실패하면(본인에게 공유 권한이 없는 파일, 외부 게스트 참여자 등) 발송하지 않는다.
+- `body_type` 기본값은 하위 호환을 위해 `text`이다. 첨부가 있으면 HTML로 변환해 발송한다.
+- 반환값: `chat_id`, `chat_type`(oneOnOne/group/meeting), `to_name`(1:1은 수신자 이름, 그룹은 채팅 주제), `attachments`, `uploaded`, `shared_with`(권한을 부여한 참여자 수).
+- 필요 권한: `Chat.ReadWrite` + `Files.ReadWrite.All`.
 
 ---
 

@@ -151,6 +151,298 @@ async def _resolve_attachments(
     return graph_attachments, errors
 
 
+_MAX_TEAMS_UPLOAD_BYTES = 250 * 1024 * 1024  # Teams 첨부용 로컬 파일 1건 한도 (메모리에 전부 읽으므로 제한)
+_UPLOAD_SIMPLE_LIMIT = 4 * 1024 * 1024       # 이하 단순 PUT, 초과 시 업로드 세션
+_UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024        # 업로드 세션 청크 크기 (320KiB 배수)
+
+
+class TeamsAttachment(BaseModel):
+    """Teams 채널 메시지에 첨부할 파일 스펙. local_path 또는 (drive_id + item_id) 중 하나만 지정한다."""
+    local_path: Optional[str] = Field(
+        default=None,
+        description="첨부할 로컬 파일의 절대경로 (예: 'C:\\Users\\me\\Desktop\\일일실적.xlsx'). "
+                    "채널의 '파일' 탭(SharePoint 채널 폴더)에 업로드한 뒤 미리보기 카드로 첨부합니다. "
+                    "이 MCP 서버가 실행 중인 PC(STDIO 모드는 사용자 본인 PC) 기준 경로이며, 파일당 250MB 이하만 지원합니다.",
+    )
+    drive_id: Optional[str] = Field(
+        default=None,
+        description="이미 SharePoint/OneDrive에 있는 파일의 드라이브 ID (item_id와 함께 지정, sharepoint_search로 확인). "
+                    "업로드 없이 해당 파일을 그대로 첨부합니다. 채널 구성원에게 그 파일의 열람 권한이 있어야 미리보기가 보입니다.",
+    )
+    item_id: Optional[str] = Field(
+        default=None,
+        description="SharePoint/OneDrive 파일 item ID (drive_id와 함께 지정)",
+    )
+
+
+def _attachment_guid_from_etag(etag: Optional[str]) -> Optional[str]:
+    """driveItem eTag('"{GUID},N"')에서 GUID를 추출한다. Teams 참조 첨부의 id로 사용한다."""
+    import re
+    m = re.search(r"\{?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}?", etag or "")
+    return m.group(1).lower() if m else None
+
+
+def _teams_reference_attachment(item: dict, fallback_url: Optional[str] = None) -> dict:
+    """driveItem JSON을 Teams chatMessage 참조 첨부(contentType='reference')로 변환한다.
+
+    Teams는 contentUrl이 SharePoint 파일 경로(…/Shared Documents/…/파일명)여야 카드와 미리보기를 표시한다.
+    webUrl이 Office 웹 뷰어 주소(_layouts/15/Doc.aspx)로 오면 fallback_url(폴더 webUrl + 파일명)을 사용한다.
+    """
+    guid = _attachment_guid_from_etag(item.get("eTag"))
+    if not guid:
+        raise ValueError(f"파일 eTag에서 첨부 ID를 추출하지 못했습니다: {item.get('eTag')!r}")
+    web_url = item.get("webUrl") or ""
+    if (not web_url or "/_layouts/" in web_url) and fallback_url:
+        web_url = fallback_url
+    if not web_url:
+        raise ValueError(f"파일 URL(webUrl)을 확인하지 못했습니다: {item.get('name')}")
+    return {
+        "id": guid,
+        "contentType": "reference",
+        "contentUrl": web_url,
+        "name": item.get("name") or "attachment",
+    }
+
+
+async def _upload_to_drive_folder(
+    client, access_token: str, drive_id: str, folder_id: str, filename: str,
+    content_bytes: bytes, conflict: str,
+) -> dict:
+    """drive_id의 folder_id 폴더 아래에 파일을 올리고 생성된 driveItem JSON을 반환한다.
+    4MB 이하는 단순 PUT, 초과 시 업로드 세션(청크)을 사용한다. conflict: 'rename' | 'replace'."""
+    from urllib.parse import quote
+
+    item_path = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{folder_id}:/{quote(filename)}:"
+    total_size = len(content_bytes)
+    auth = {"Authorization": f"Bearer {access_token}"}
+
+    if total_size <= _UPLOAD_SIMPLE_LIMIT:
+        resp = await client.put(
+            f"{item_path}/content",
+            params={"@microsoft.graph.conflictBehavior": conflict},
+            content=content_bytes,
+            headers={**auth, "Content-Type": "application/octet-stream"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    sess_resp = await client.post(
+        f"{item_path}/createUploadSession",
+        json={"item": {"@microsoft.graph.conflictBehavior": conflict}},
+        headers={**auth, "Content-Type": "application/json"},
+    )
+    sess_resp.raise_for_status()
+    upload_url = sess_resp.json()["uploadUrl"]
+
+    data: dict = {}
+    for start in range(0, total_size, _UPLOAD_CHUNK_SIZE):
+        end = min(start + _UPLOAD_CHUNK_SIZE - 1, total_size - 1)
+        chunk = content_bytes[start:end + 1]
+        chunk_resp = await client.put(upload_url, content=chunk, headers={
+            "Content-Range": f"bytes {start}-{end}/{total_size}",
+            "Content-Length": str(len(chunk)),
+        })
+        if chunk_resp.status_code in (200, 201):
+            data = chunk_resp.json()
+        elif chunk_resp.status_code != 202:
+            chunk_resp.raise_for_status()
+    if not data:
+        raise ValueError(f"업로드 세션이 완료 응답을 반환하지 않았습니다: {filename}")
+    return data
+
+
+def _validate_teams_attachments(attachments: Optional[List["TeamsAttachment"]]) -> tuple:
+    """업로드 전에 TeamsAttachment 입력을 검증한다. 반환값: (local_path가 있는 spec 목록, errors).
+    오류를 업로드 전에 모두 모아 부분 업로드를 줄인다.
+
+    HTTP 모드(사내 공용 서버)에서는 local_path가 서버 파일시스템을 가리키므로 _resolve_attachments와 같은 이유로 거부한다.
+    """
+    import os
+    from ms365.auth import get_request_token
+
+    is_http_mode = bool(get_request_token())
+    local_specs: List["TeamsAttachment"] = []
+    errors: List[dict] = []
+    for spec in attachments or []:
+        spec_desc = spec.model_dump(exclude_none=True)
+        if spec.local_path and (spec.drive_id or spec.item_id):
+            errors.append({"spec": spec_desc, "reason": "local_path와 drive_id/item_id는 함께 지정할 수 없습니다."})
+        elif spec.local_path:
+            if is_http_mode:
+                errors.append({"spec": spec_desc, "reason": "HTTP 모드(사내 공용 서버)에서는 local_path 첨부를 지원하지 않습니다. "
+                                                           "SharePoint에 업로드 후 drive_id/item_id로 첨부하세요."})
+            elif not os.path.isfile(spec.local_path):
+                errors.append({"spec": spec_desc, "reason": f"파일을 찾을 수 없습니다: {spec.local_path}"})
+            elif os.path.getsize(spec.local_path) > _MAX_TEAMS_UPLOAD_BYTES:
+                errors.append({"spec": spec_desc, "reason": "파일 크기가 첨부 한도(250MB)를 초과합니다. "
+                                                           "SharePoint에 직접 업로드 후 drive_id/item_id로 첨부하세요."})
+            else:
+                local_specs.append(spec)
+        elif not (spec.drive_id and spec.item_id):
+            errors.append({"spec": spec_desc, "reason": "local_path 또는 (drive_id + item_id)를 지정해야 합니다."})
+    return local_specs, errors
+
+
+async def _build_teams_attachments(
+    client, access_token: str, attachments: List["TeamsAttachment"], folder: Optional[dict], conflict: str,
+) -> tuple:
+    """검증된 TeamsAttachment 목록을 Teams 참조 첨부 배열로 변환한다.
+    local_path는 folder(driveItem: id, webUrl, parentReference.driveId)에 업로드하고,
+    drive_id+item_id는 기존 파일 정보를 조회한다.
+    반환값: (graph_attachments, uploaded 요약 목록, files[{drive_id, item_id, name}], errors)
+    """
+    import os
+    from urllib.parse import quote
+    import httpx
+
+    auth = {"Authorization": f"Bearer {access_token}"}
+    graph_attachments: List[dict] = []
+    uploaded: List[dict] = []
+    files: List[dict] = []
+    errors: List[dict] = []
+
+    for spec in attachments:
+        spec_desc = spec.model_dump(exclude_none=True)
+        try:
+            if spec.local_path:
+                filename = os.path.basename(spec.local_path)
+                with open(spec.local_path, "rb") as f:
+                    content_bytes = f.read()
+                drive_id = folder["parentReference"]["driveId"]
+                item = await _upload_to_drive_folder(
+                    client, access_token, drive_id, folder["id"], filename, content_bytes, conflict,
+                )
+                folder_url = (folder.get("webUrl") or "").rstrip("/")
+                fallback = f"{folder_url}/{quote(item.get('name') or filename)}" if folder_url else None
+                graph_attachments.append(_teams_reference_attachment(item, fallback))
+                uploaded.append({"source": spec.local_path, "name": item.get("name"), "size": item.get("size"),
+                                 "drive_id": drive_id, "item_id": item.get("id"), "web_url": item.get("webUrl")})
+                files.append({"drive_id": drive_id, "item_id": item.get("id"), "name": item.get("name")})
+            else:
+                resp = await client.get(
+                    f"https://graph.microsoft.com/v1.0/drives/{spec.drive_id}/items/{spec.item_id}",
+                    params={"$select": "id,name,eTag,webUrl,folder,parentReference"},
+                    headers=auth,
+                )
+                resp.raise_for_status()
+                item = resp.json()
+                if item.get("folder") is not None:
+                    raise ValueError(f"폴더는 첨부할 수 없습니다: {item.get('name')}")
+                graph_attachments.append(_teams_reference_attachment(item))
+                files.append({"drive_id": spec.drive_id, "item_id": spec.item_id, "name": item.get("name")})
+        except httpx.HTTPStatusError as e:
+            errors.append({"spec": spec_desc,
+                           "reason": f"Graph API 오류({e.response.status_code}): {e.response.text[:200]}"})
+        except Exception as e:
+            errors.append({"spec": spec_desc, "reason": str(e)})
+
+    return graph_attachments, uploaded, files, errors
+
+
+async def _resolve_teams_attachments(
+    client, access_token: str, team_id: str, channel_id: str,
+    attachments: Optional[List["TeamsAttachment"]], conflict: str,
+) -> tuple:
+    """채널 메시지용 첨부를 준비한다. local_path는 채널 파일 폴더(filesFolder)에 업로드한다.
+    채널 폴더는 채널 구성원에게 권한이 상속되므로 별도 권한 부여가 필요 없다.
+    반환값: (graph_attachments, uploaded 요약 목록, errors). errors가 있으면 메시지를 발송하지 않아야 한다.
+    """
+    if not attachments:
+        return [], [], []
+    local_specs, errors = _validate_teams_attachments(attachments)
+    if errors:
+        return [], [], errors
+
+    folder = None
+    if local_specs:  # 채널 파일 폴더는 로컬 업로드가 있을 때만 조회한다
+        resp = await client.get(
+            f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/filesFolder",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if resp.status_code == 404:
+            return [], [], [{"spec": "filesFolder", "reason": "채널 파일 폴더를 찾지 못했습니다. Teams에서 해당 채널의 '파일' 탭을 "
+                                                         "한 번 열어 폴더를 생성한 뒤 다시 시도하세요."}]
+        if resp.status_code >= 400:
+            return [], [], [{"spec": "filesFolder", "reason": f"채널 파일 폴더 조회 실패(HTTP {resp.status_code}): "
+                                                         "Files.ReadWrite.All/Sites.ReadWrite.All 권한과 채널 구성원 여부를 확인하세요. "
+                                                         f"{resp.text[:200]}"}]
+        folder = resp.json()
+
+    graph_attachments, uploaded, _files, errors = await _build_teams_attachments(
+        client, access_token, attachments, folder, conflict,
+    )
+    return graph_attachments, uploaded, errors
+
+
+_CHAT_FILES_FOLDER_NAMES = ("Microsoft Teams Chat Files", "Microsoft Teams 채팅 파일")
+
+
+async def _get_chat_files_folder(client, access_token: str) -> dict:
+    """로그인 사용자 OneDrive 루트의 Teams 채팅 첨부 폴더(driveItem)를 반환한다.
+    Teams 클라이언트가 채팅 첨부를 올리는 폴더와 같은 곳을 쓰며, 언어별 이름(영문/한글)을 모두 찾는다.
+    없으면 'Microsoft Teams Chat Files' 폴더를 만든다. 실패 시 httpx 예외를 그대로 전파한다."""
+    auth = {"Authorization": f"Bearer {access_token}"}
+    url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+    params = {"$select": "id,name,webUrl,folder,parentReference", "$top": "999"}
+    while url:
+        resp = await client.get(url, params=params, headers=auth)
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("value", []):
+            if item.get("folder") is not None and item.get("name") in _CHAT_FILES_FOLDER_NAMES:
+                return item
+        url, params = data.get("@odata.nextLink"), None
+
+    resp = await client.post(
+        "https://graph.microsoft.com/v1.0/me/drive/root/children",
+        json={"name": _CHAT_FILES_FOLDER_NAMES[0], "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+        headers={**auth, "Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _grant_read_to_users(client, access_token: str, files: List[dict], user_ids: List[str]) -> List[dict]:
+    """files의 각 파일에 user_ids 사용자의 읽기 권한을 부여한다(안내 메일 없음, 사내 로그인 필수).
+    Graph API로 올린 채팅 첨부는 Teams 클라이언트와 달리 자동 공유되지 않으므로 발송 전에 호출한다.
+    반환값: errors 목록(빈 목록이면 모두 성공)."""
+    import httpx
+
+    errors: List[dict] = []
+    if not files or not user_ids:
+        return errors
+    payload = {
+        "recipients": [{"objectId": uid} for uid in user_ids],
+        "requireSignIn": True,
+        "sendInvitation": False,
+        "roles": ["read"],
+    }
+    for f in files:
+        try:
+            resp = await client.post(
+                f"https://graph.microsoft.com/v1.0/drives/{f['drive_id']}/items/{f['item_id']}/invite",
+                json=payload,
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            errors.append({"spec": f.get("name"), "reason": f"채팅 참여자 열람 권한 부여 실패({e.response.status_code}): "
+                                                           f"{e.response.text[:200]}"})
+        except Exception as e:
+            errors.append({"spec": f.get("name"), "reason": f"채팅 참여자 열람 권한 부여 실패: {e}"})
+    return errors
+
+
+def _apply_attachment_tags(content: str, body_type: str, graph_attachments: List[dict]) -> str:
+    """본문 끝에 Teams 첨부 자리 태그(<attachment id="…"></attachment>)를 붙인다.
+    첨부 태그는 HTML 본문에서만 동작하므로 body_type='text'이면 HTML로 변환한다."""
+    import html
+    if body_type == "text":
+        content = html.escape(content).replace("\n", "<br>")
+    tags = "".join(f'<attachment id="{a["id"]}"></attachment>' for a in graph_attachments)
+    return f"{content}{tags}"
+
+
 _MENTION_RESERVED = {"channel", "team"}  # mentions 예약어: 현재 채널 / 현재 팀
 
 
@@ -368,8 +660,18 @@ def register_ms365_tools(mcp):
                         "본문의 {mention0}, {mention1}… 자리표시자가 순서대로 '@표시이름'으로 바뀌며, "
                         "자리표시자가 없으면 본문 맨 앞에 멘션이 붙습니다. org_users_search로 이메일을 확인할 수 있습니다.",
         )] = None,
+        attachments: Annotated[Optional[List[TeamsAttachment]], Field(
+            description="첨부파일 목록. 각 항목은 local_path(로컬 파일 → 채널 '파일' 탭에 업로드 후 첨부) 또는 "
+                        "drive_id+item_id(이미 SharePoint/OneDrive에 있는 파일) 중 하나입니다. "
+                        "Teams 화면에 파일 카드(미리보기 포함)로 본문 아래에 표시됩니다.",
+        )] = None,
+        file_conflict: Annotated[Literal["rename", "replace"], Field(
+            description="local_path 업로드 시 채널 폴더에 같은 이름의 파일이 있을 때의 처리: "
+                        "'rename'(기본, '파일명 1.xlsx'처럼 새 이름으로 저장해 이전 메시지의 첨부를 보존) 또는 "
+                        "'replace'(기존 파일 덮어쓰기, 이전 메시지의 카드도 최신본을 가리킴)",
+        )] = "rename",
     ) -> dict:
-        """Teams 채널에 메시지를 전송합니다. 사용자·채널·팀 @멘션을 포함할 수 있습니다.
+        """Teams 채널에 메시지를 전송합니다. 사용자·채널·팀 @멘션과 파일 첨부(미리보기 카드)를 포함할 수 있습니다.
         team_id와 channel_id는 MS365 read MCP의 chat_message_search 도구로 미리 확인하세요.
 
         body_type 기본값은 'html'이며, message에는 Teams가 지원하는 HTML 요소를 사용하세요(아래 목록).
@@ -396,9 +698,22 @@ def register_ms365_tools(mcp):
         - <emoji>, <customemoji>: 이모지
         - <codeblock>: 코드 블록 (언어별 문법 강조는 적용되지 않음)
 
+        파일 첨부 사용법:
+        - local_path: 채널의 '파일' 탭(SharePoint 채널 폴더 루트)에 업로드한 뒤 참조 첨부로 붙입니다.
+          채널 폴더에 저장되므로 채널 구성원 전원이 열람·미리보기할 수 있습니다. 파일당 250MB 이하, STDIO 모드 전용입니다.
+          예) attachments=[{"local_path": "C:\\\\Reports\\\\일일실적.xlsx"}, {"local_path": "C:\\\\Reports\\\\주간진도율.png"}]
+        - drive_id+item_id: 업로드 없이 기존 파일을 그대로 붙입니다(sharepoint_search로 확인).
+          채널 구성원에게 그 파일의 열람 권한이 없으면 카드가 열리지 않으므로, 가능하면 채널 폴더의 파일을 사용하세요.
+        - 첨부 카드는 본문 아래에 지정한 순서대로 표시됩니다. 본문에 첨부 태그를 직접 작성하지 마세요.
+        - 첨부가 있으면 body_type='text'여도 HTML로 변환해 발송합니다.
+        - 첨부 처리(업로드·조회) 중 하나라도 실패하면 메시지를 발송하지 않습니다. 이미 업로드된 파일은 채널 폴더에 남으며
+          반환값 uploaded에 표시됩니다.
+        - 미리보기 썸네일은 SharePoint가 생성하므로 업로드 직후에는 잠시 아이콘만 보일 수 있습니다.
+
         Azure AD 앱에 ChannelMessage.Send Delegated 권한이 필요합니다.
         멘션 대상 조회에는 User.Read.All(사용자), Channel.ReadBasic.All(채널명), Team.ReadBasic.All(팀명)을 사용합니다.
-        발송 전 반드시 사용자에게 채널, 멘션 대상, 메시지 내용을 확인받으세요.
+        파일 첨부에는 Files.ReadWrite.All(또는 Sites.ReadWrite.All)이 필요합니다.
+        발송 전 반드시 사용자에게 채널, 멘션 대상, 첨부파일, 메시지 내용을 확인받으세요.
         """
         auth_err = require_auth()
         if auth_err:
@@ -425,13 +740,34 @@ def register_ms365_tools(mcp):
                 else:
                     mentions_payload, mention_summary = [], []
                     payload = {"body": {"contentType": body_type, "content": message}}
+
+                graph_attachments, uploaded, attach_errors = await _resolve_teams_attachments(
+                    client, access_token, team_id, channel_id, attachments, file_conflict,
+                )
+                if attach_errors:
+                    return {
+                        "success": False,
+                        "message": "첨부파일 처리 실패로 메시지를 발송하지 않았습니다.",
+                        "attachment_errors": attach_errors,
+                        "uploaded": uploaded,
+                    }
+                if graph_attachments:
+                    payload["body"] = {
+                        "contentType": "html",
+                        "content": _apply_attachment_tags(
+                            payload["body"]["content"], payload["body"]["contentType"], graph_attachments,
+                        ),
+                    }
+                    payload["attachments"] = graph_attachments
+
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
 
-            sent_body_type = "html" if mentions_payload else body_type
-            log.info("send_teams_channel_message: team=%s channel=%s id=%s body_type=%s mentions=%d (by %s)",
-                     team_id, channel_id, data.get("id"), sent_body_type, len(mentions_payload), get_user_email())
+            sent_body_type = payload["body"]["contentType"]
+            log.info("send_teams_channel_message: team=%s channel=%s id=%s body_type=%s mentions=%d attachments=%d (by %s)",
+                     team_id, channel_id, data.get("id"), sent_body_type, len(mentions_payload),
+                     len(graph_attachments), get_user_email())
             return {
                 "success": True,
                 "message_id": data.get("id"),
@@ -439,6 +775,8 @@ def register_ms365_tools(mcp):
                 "channel_id": channel_id,
                 "body_type": sent_body_type,
                 "mentioned": mention_summary,
+                "attachments": [{"name": a["name"], "url": a["contentUrl"]} for a in graph_attachments],
+                "uploaded": uploaded,
                 "web_url": data.get("webUrl"),
                 "sent_by": get_user_email(),
             }
@@ -686,25 +1024,61 @@ def register_ms365_tools(mcp):
             return {"success": False, "message": str(e)}
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Tool MS365-5: Teams 1:1 채팅 메시지 발송
+    # Tool MS365-5: Teams 채팅(1:1·그룹) 메시지 발송
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
     async def send_teams_chat_message(
-        recipient_email: Annotated[str, Field(min_length=1, description="수신자 이메일 주소 (예: 'user@iroyal.kr'). org_users_search로 미리 확인할 수 있습니다.")],
-        message: Annotated[str, Field(min_length=1, description="전송할 메시지 본문 (텍스트)")],
+        message: Annotated[str, Field(min_length=1, description="전송할 메시지 본문 (body_type='html'이면 HTML 마크업 문자열)")],
+        recipient_email: Annotated[str, Field(
+            description="1:1 채팅 수신자 이메일 (예: 'user@iroyal.kr'). org_users_search로 확인할 수 있습니다. "
+                        "chat_id와 둘 중 하나만 지정합니다.",
+        )] = "",
+        chat_id: Annotated[str, Field(
+            description="발송할 기존 채팅 ID(그룹 채팅·회의 채팅·1:1 채팅). teams_unread_chats, chat_message_search, "
+                        "teams_group_chat_messages 결과에서 확인합니다. recipient_email과 둘 중 하나만 지정합니다.",
+        )] = "",
+        body_type: Annotated[Literal["text", "html"], Field(
+            description="본문 형식: 'text'(기본, 서식 없는 텍스트) 또는 'html'(굵게·목록·줄바꿈 등 서식 적용). "
+                        "첨부가 있으면 'text'도 HTML로 변환해 발송합니다.",
+        )] = "text",
+        attachments: Annotated[Optional[List[TeamsAttachment]], Field(
+            description="첨부파일 목록. 각 항목은 local_path(로컬 파일 → 본인 OneDrive 'Microsoft Teams Chat Files' 폴더에 "
+                        "업로드 후 첨부) 또는 drive_id+item_id(이미 SharePoint/OneDrive에 있는 파일) 중 하나입니다. "
+                        "채팅 참여자에게 읽기 권한을 부여한 뒤 파일 카드(미리보기 포함)로 첨부합니다.",
+        )] = None,
+        file_conflict: Annotated[Literal["rename", "replace"], Field(
+            description="local_path 업로드 시 같은 이름의 파일이 있을 때의 처리: 'rename'(기본, 새 이름으로 저장) "
+                        "또는 'replace'(기존 파일 덮어쓰기)",
+        )] = "rename",
     ) -> dict:
-        """Teams 1:1 채팅으로 메시지를 전송합니다.
+        """Teams 채팅(1:1 또는 그룹)으로 메시지를 전송합니다. 파일 첨부(미리보기 카드)를 포함할 수 있습니다.
 
-        내부적으로 수신자와의 1:1 채팅방을 자동으로 생성(또는 기존 채팅방 재사용)한 뒤
-        메시지를 발송합니다. 수신자는 Teams 채팅 탭에서 메시지를 확인할 수 있습니다.
+        발송 대상 지정:
+        - recipient_email: 수신자와의 1:1 채팅방을 자동으로 생성(이미 있으면 기존 채팅방 재사용)해 발송합니다.
+        - chat_id: 기존 채팅(그룹 채팅 포함)에 발송합니다. 새 그룹 채팅은 만들지 않습니다.
+
+        파일 첨부 사용법:
+        - local_path: 본인 OneDrive의 'Microsoft Teams Chat Files'(한글 환경은 'Microsoft Teams 채팅 파일') 폴더에
+          업로드합니다. Teams 앱에서 채팅에 파일을 올릴 때 쓰는 폴더와 같습니다. 파일당 250MB 이하, STDIO 모드 전용입니다.
+        - drive_id+item_id: 업로드 없이 기존 파일을 그대로 붙입니다(sharepoint_search로 확인).
+        - Graph API로 올린 파일은 Teams 앱과 달리 자동으로 공유되지 않으므로, 발송 전에 본인을 제외한 채팅 참여자 전원에게
+          읽기 권한(사내 로그인 필수, 안내 메일 없음)을 부여합니다. 기존 파일(drive_id+item_id)에도 같은 권한을 부여하므로
+          공유해도 되는 파일인지 확인하세요. 권한을 부여할 수 없는 파일(본인에게 공유 권한이 없는 파일 등)은 오류로 반환합니다.
+        - 첨부 카드는 본문 아래에 지정한 순서대로 표시됩니다. 본문에 첨부 태그를 직접 작성하지 마세요.
+        - 업로드·조회·권한 부여 중 하나라도 실패하면 메시지를 발송하지 않습니다. 이미 업로드된 파일은 OneDrive에 남으며
+          반환값 uploaded에 표시됩니다.
 
         사용 예시:
-          - recipient_email: "hong@iroyal.kr"
-          - message: "회의 자료 검토 부탁드립니다."
+          - 1:1: recipient_email="hong@iroyal.kr", message="회의 자료 검토 부탁드립니다."
+          - 그룹 + 첨부: chat_id="19:xxx@thread.v2", message="<p>견적서 첨부합니다.</p>", body_type="html",
+            attachments=[{"local_path": "C:\\\\Docs\\\\견적서.pdf"}]
 
-        Azure AD 앱에 Chat.ReadWrite Delegated 권한이 필요합니다.
-        발송 전 반드시 사용자에게 수신자와 메시지 내용을 확인받으세요.
+        Azure AD 앱에 Chat.ReadWrite Delegated 권한이 필요하며, 파일 첨부에는 Files.ReadWrite.All이 필요합니다.
+        발송 전 반드시 사용자에게 대상(수신자 또는 채팅방), 첨부파일, 메시지 내용을 확인받으세요.
         """
+        if bool(recipient_email.strip()) == bool(chat_id.strip()):
+            return {"success": False, "message": "recipient_email(1:1 채팅) 또는 chat_id(기존 채팅) 중 하나만 지정하세요."}
+
         auth_err = require_auth()
         if auth_err:
             return auth_err
@@ -721,8 +1095,15 @@ def register_ms365_tools(mcp):
             "Content-Type": "application/json",
         }
 
+        local_specs, attach_errors = _validate_teams_attachments(attachments)
+        if attach_errors:
+            return {"success": False, "message": "첨부파일 입력 오류로 메시지를 발송하지 않았습니다.",
+                    "attachment_errors": attach_errors, "uploaded": []}
+
+        recipient_name = None
+        chat_type = None
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=120 if attachments else 30) as client:
                 # ── Step 1: 로그인 사용자 ID 가져오기 ──────────────
                 me_resp = await client.get(
                     "https://graph.microsoft.com/v1.0/me",
@@ -734,50 +1115,89 @@ def register_ms365_tools(mcp):
                 my_id = me_data["id"]
                 my_email = me_data.get("mail") or me_data.get("userPrincipalName")
 
-                # ── Step 2: 수신자 사용자 ID 조회 ─────────────────
-                user_resp = await client.get(
-                    f"https://graph.microsoft.com/v1.0/users/{recipient_email}",
-                    params={"$select": "id,displayName,mail,userPrincipalName"},
-                    headers=headers,
-                )
-                user_resp.raise_for_status()
-                recipient_data = user_resp.json()
-                recipient_id = recipient_data["id"]
-                recipient_name = recipient_data.get("displayName", recipient_email)
+                if recipient_email.strip():
+                    # ── Step 2a: 수신자 조회 후 1:1 채팅방 생성 (이미 존재하면 기존 채팅방 반환) ──
+                    user_resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/users/{recipient_email.strip()}",
+                        params={"$select": "id,displayName,mail,userPrincipalName"},
+                        headers=headers,
+                    )
+                    user_resp.raise_for_status()
+                    recipient_data = user_resp.json()
+                    recipient_id = recipient_data["id"]
+                    recipient_name = recipient_data.get("displayName", recipient_email)
 
-                # ── Step 3: 1:1 채팅방 생성 (이미 존재하면 기존 채팅방 반환) ──
-                create_chat_body = {
-                    "chatType": "oneOnOne",
-                    "members": [
-                        {
-                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                            "roles": ["owner"],
-                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{my_id}')",
-                        },
-                        {
-                            "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                            "roles": ["owner"],
-                            "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{recipient_id}')",
-                        },
-                    ],
-                }
-                chat_resp = await client.post(
-                    "https://graph.microsoft.com/v1.0/chats",
-                    json=create_chat_body,
-                    headers=headers,
-                )
-                chat_resp.raise_for_status()
-                chat_data = chat_resp.json()
-                chat_id = chat_data["id"]
+                    create_chat_body = {
+                        "chatType": "oneOnOne",
+                        "members": [
+                            {
+                                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                                "roles": ["owner"],
+                                "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{uid}')",
+                            }
+                            for uid in (my_id, recipient_id)
+                        ],
+                    }
+                    chat_resp = await client.post(
+                        "https://graph.microsoft.com/v1.0/chats",
+                        json=create_chat_body,
+                        headers=headers,
+                    )
+                    chat_resp.raise_for_status()
+                    target_chat_id = chat_resp.json()["id"]
+                    chat_type = "oneOnOne"
+                    member_ids = [recipient_id]
+                else:
+                    # ── Step 2b: 기존 채팅 정보와 참여자 조회 ─────────
+                    target_chat_id = chat_id.strip()
+                    info_resp = await client.get(
+                        f"https://graph.microsoft.com/v1.0/chats/{target_chat_id}",
+                        params={"$select": "id,chatType,topic"},
+                        headers=headers,
+                    )
+                    info_resp.raise_for_status()
+                    chat_info = info_resp.json()
+                    chat_type = chat_info.get("chatType")
+                    recipient_name = chat_info.get("topic")
+                    member_ids = []
+                    if attachments:
+                        members_resp = await client.get(
+                            f"https://graph.microsoft.com/v1.0/chats/{target_chat_id}/members",
+                            headers=headers,
+                        )
+                        members_resp.raise_for_status()
+                        member_ids = [m["userId"] for m in members_resp.json().get("value", [])
+                                      if m.get("userId") and m.get("userId") != my_id]
+
+                # ── Step 3: 첨부 준비 (업로드 → 참여자 읽기 권한 부여) ──
+                graph_attachments: List[dict] = []
+                uploaded: List[dict] = []
+                if attachments:
+                    folder = await _get_chat_files_folder(client, access_token) if local_specs else None
+                    graph_attachments, uploaded, files, attach_errors = await _build_teams_attachments(
+                        client, access_token, attachments, folder, file_conflict,
+                    )
+                    if not attach_errors:
+                        attach_errors = await _grant_read_to_users(client, access_token, files, member_ids)
+                    if attach_errors:
+                        return {
+                            "success": False,
+                            "message": "첨부파일 처리 실패로 메시지를 발송하지 않았습니다.",
+                            "attachment_errors": attach_errors,
+                            "uploaded": uploaded,
+                        }
 
                 # ── Step 4: 메시지 발송 ───────────────────────────
-                msg_body = {
-                    "body": {
-                        "content": message,
+                if graph_attachments:
+                    msg_body = {
+                        "body": {"contentType": "html",
+                                 "content": _apply_attachment_tags(message, body_type, graph_attachments)},
+                        "attachments": graph_attachments,
                     }
-                }
+                else:
+                    msg_body = {"body": {"contentType": body_type, "content": message}}
                 msg_resp = await client.post(
-                    f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages",
+                    f"https://graph.microsoft.com/v1.0/chats/{target_chat_id}/messages",
                     json=msg_body,
                     headers=headers,
                 )
@@ -785,16 +1205,22 @@ def register_ms365_tools(mcp):
                 msg_data = msg_resp.json()
 
             log.info(
-                "send_teams_chat_message: from=%s to=%s (%s) chat=%s msg=%s",
-                my_email, recipient_email, recipient_name, chat_id, msg_data.get("id"),
+                "send_teams_chat_message: from=%s to=%s chat=%s type=%s msg=%s attachments=%d",
+                my_email, recipient_email or chat_id, target_chat_id, chat_type, msg_data.get("id"),
+                len(graph_attachments),
             )
             return {
                 "success": True,
-                "chat_id": chat_id,
+                "chat_id": target_chat_id,
+                "chat_type": chat_type,
                 "message_id": msg_data.get("id"),
                 "from": my_email,
-                "to": recipient_email,
+                "to": recipient_email or None,
                 "to_name": recipient_name,
+                "body_type": msg_body["body"]["contentType"],
+                "attachments": [{"name": a["name"], "url": a["contentUrl"]} for a in graph_attachments],
+                "uploaded": uploaded,
+                "shared_with": len(member_ids) if graph_attachments else 0,
                 "message_preview": message[:100],
             }
         except httpx.HTTPStatusError as e:
