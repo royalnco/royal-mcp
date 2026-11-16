@@ -55,12 +55,12 @@ Write-Host "[2/3] pip 업그레이드 중..." -ForegroundColor Cyan
 Write-Host "      완료" -ForegroundColor Green
 
 # 3. 패키지 설치
-if ($Dev) {
-    Write-Host "[3/3] 패키지 설치 중 (개발자 모드)..." -ForegroundColor Cyan
-    & $pip install -r "$scriptDir\requirements-dev.txt"
-} else {
-    Write-Host "[3/3] 패키지 설치 중..." -ForegroundColor Cyan
-    & $pip install -r "$scriptDir\requirements.txt"
+$req = if ($Dev) { "requirements-dev.txt" } else { "requirements.txt" }
+Write-Host "[3/3] 패키지 설치 중$(if ($Dev) {' (개발자 모드)'})..." -ForegroundColor Cyan
+& $python -m pip install -r "$scriptDir\$req"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ 패키지 설치 실패 (exit $LASTEXITCODE)" -ForegroundColor Red
+    exit 1
 }
 Write-Host "      완료" -ForegroundColor Green
 

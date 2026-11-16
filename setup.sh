@@ -68,11 +68,17 @@ echo "      완료"
 
 # 3. 패키지 설치
 if [ "$DEV" = true ]; then
+  REQ="requirements-dev.txt"
   echo "[3/3] 패키지 설치 중 (개발자 모드)..."
-  "$PIP" install -r "$SCRIPT_DIR/requirements-dev.txt"
 else
+  REQ="requirements.txt"
   echo "[3/3] 패키지 설치 중..."
-  "$PIP" install -r "$SCRIPT_DIR/requirements.txt"
+fi
+rc=0
+"$PYTHON" -m pip install -r "$SCRIPT_DIR/$REQ" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "❌ 패키지 설치 실패 (exit $rc)"
+  exit 1
 fi
 echo "      완료"
 
